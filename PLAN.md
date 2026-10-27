@@ -45,7 +45,7 @@
     - [x] Hide more detail behind --verbose/-v
     - Maybe print a table of results?
     - [x] server
-        - [ ] print the action and from where (do later)
+        - [x] print the action and from where (do later)
 - [x] Lint and cleanup
     - [x] DRY violations:
         - [x] Extract common read operation error handling (4x duplication)
@@ -73,7 +73,7 @@
         - [x] gemini
 - [ ] Add comprehensive error handling and retry logic
     - [ ] Very good error messages for common issues
-        - [ ] inputs and discretes are not writeable
+        - [x] inputs and discretes are not writeable
     - [x] Timeout configuration
 - [x] Add basic unit tests for fast execution (28 tests total)
     - [x] CLI validation tests (6 tests)
@@ -115,3 +115,42 @@
 ## Future Enhancements
 - [ ] Server configuration files (holding file, etc.)
 - [ ] Probing functionality (removed from current scope)
+
+## Upgrade dependencies
+- [x] Bump direct crates to the latest crates.io releases
+- [x] Adjust code for API changes without changing Modbus behavior
+- [x] Update the documented Rust version to the new minimum
+- [x] `cargo test` and `cargo clippy` pass
+
+## Application functions and the four data areas
+- [x] Accept decimal PDU addresses, `0x` hexadecimal PDU addresses, and 5- or 6-digit `0/1/3/4` area references
+- [x] Add command aliases `discrete-output`/`0xxxx`, `discrete-input`/`1xxxx`, `input-register`/`3xxxx`, `holding-register`/`4xxxx`
+- [x] Reject writes to discrete inputs and input registers before opening a connection
+- [x] Implement functions 07, 08, 11, 12, 17, 20, 21, 22, 23, 24, and 43/14 on the client and memory server
+- [x] Enforce write quantity limits and return exception 03 for an illegal quantity
+- [x] Leave function 43/13 unimplemented; the RTU codec cannot frame functions 08, 20, and 21
+- [x] Document the areas, address forms, and commands in the README
+
+## Decode register values
+- [x] Decode reads as binary, hexadecimal, ANSI, 16/32/64-bit signed and unsigned integers, and IEEE 754 `f32`/`f64`
+- [x] Default 32/64-bit register order to MSRF and accept LSRF
+- [x] Swap bytes inside each register for every decode format
+- [x] Document the flags in the README
+- [x] When `--decode` is set, print only the decoded table
+- [x] README states that `--decode` replaces the raw register table
+
+## Read duration
+- [x] Client `--timeout` is seconds of repeated reading: omit for one read, a positive value stops at that time, `0` or negative repeats until interrupted
+- [x] Server `--timeout` still covers bind, serial open, and idle TCP connections
+- [x] Document the flag in the README
+- [x] Repeating reads redraw the sample in place
+- [x] Each sample is a returned string painted with cursor-up erase, not appended scrollback
+
+## Align documentation with runtime
+- [x] Install the `mb` binary from the `mb-cli` package
+- [x] Server requires `--ip` or `--device`
+- [x] Server `--unit` answers only that id
+- [x] Server `--verbose` / `-v` logs each request and the TCP client address
+- [x] Server `--timeout` covers bind, serial open, and idle TCP connections
+- [x] Startup text matches coil/discrete OFF and register address initialization
+- [x] CLI examples use the singular `coil` command

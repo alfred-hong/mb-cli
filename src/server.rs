@@ -1,8 +1,173 @@
 use crate::cli::{DataBits, Parity, StopBits};
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::{timeout, Instant};
 use tokio_modbus::prelude::*;
 use tokio_modbus::server::{rtu, tcp::Server, Service};
+
+/// Runtime options shared by the TCP and RTU servers.
+pub struct ServerRuntime {
+    pub unit: u8,
+    pub verbose: bool,
+    pub timeout_secs: u64,
+}
+
+/// TCP or RTU listener selected from `--ip` / `--device`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServerListen {
+    Tcp(IpAddr),
+    Rtu(PathBuf),
+}
+
+/// Require exactly one of `--ip` or `--device`.
+pub fn server_listen(ip: Option<IpAddr>, device: Option<PathBuf>) -> anyhow::Result<ServerListen> {
+    match (ip, device) {
+        (Some(ip), None) => Ok(ServerListen::Tcp(ip)),
+        (None, Some(device)) => Ok(ServerListen::Rtu(device)),
+        (None, None) => Err(anyhow::anyhow!(
+            "Must specify either --ip for TCP or --device for RTU"
+        )),
+        (Some(_), Some(_)) => Err(anyhow::anyhow!("Cannot specify both --ip and --device")),
+    }
+}
+
+pub(crate) fn log_line(verbose: bool, peer: Option<&str>, message: &str) {
+    if !verbose {
+        return;
+    }
+    match peer {
+        Some(peer) => println!("{message} from {peer}"),
+        None => println!("{message}"),
+    }
+}
+
+fn idle_sleep(timeout_secs: Duration) -> Option<Pin<Box<tokio::time::Sleep>>> {
+    let deadline = Instant::now().checked_add(timeout_secs)?;
+    Some(Box::pin(tokio::time::sleep_until(deadline)))
+}
+
+/// Closes a quiet TCP connection after `timeout` with a clean EOF.
+struct IdleTimeoutStream<S> {
+    inner: S,
+    timeout: Duration,
+    idle: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> IdleTimeoutStream<S> {
+    fn new(inner: S, timeout: Duration) -> Self {
+        let idle = idle_sleep(timeout);
+        Self {
+            inner,
+            timeout,
+            idle,
+        }
+    }
+
+    fn reset_idle(&mut self) {
+        self.idle = idle_sleep(self.timeout);
+    }
+}
+
+impl<S> AsyncRead for IdleTimeoutStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(idle) = this.idle.as_mut() {
+            if idle.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        let filled = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) if buf.filled().len() > filled => {
+                this.reset_idle();
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S> AsyncWrite for IdleTimeoutStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) if n > 0 => {
+                this.reset_idle();
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Counters and flags for function 08/11/12.
+#[derive(Debug, Clone)]
+pub struct Diagnostics {
+    pub register: u16,
+    pub delimiter: u8,
+    pub listen_only: bool,
+    pub event_count: u16,
+    pub message_count: u16,
+    pub comm_error_count: u16,
+    pub exception_count: u16,
+    pub server_message_count: u16,
+    pub no_response_count: u16,
+    pub nak_count: u16,
+    pub busy_count: u16,
+    pub overrun_count: u16,
+    pub events: VecDeque<u8>,
+}
+
+impl Default for Diagnostics {
+    fn default() -> Self {
+        Self {
+            register: 0,
+            delimiter: 0x0A,
+            listen_only: false,
+            event_count: 0,
+            message_count: 0,
+            comm_error_count: 0,
+            exception_count: 0,
+            server_message_count: 0,
+            no_response_count: 0,
+            nak_count: 0,
+            busy_count: 0,
+            overrun_count: 0,
+            events: VecDeque::new(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ModbusData {
@@ -10,6 +175,9 @@ pub struct ModbusData {
     pub discrete_inputs: Vec<bool>,
     pub holding_registers: Vec<u16>,
     pub input_registers: Vec<u16>,
+    /// File records addressed by `(file number, record number)`.
+    pub files: HashMap<(u16, u16), u16>,
+    pub diagnostics: Diagnostics,
 }
 
 impl ModbusData {
@@ -19,6 +187,8 @@ impl ModbusData {
             discrete_inputs: vec![false; num_discrete as usize],
             holding_registers: (0..num_holding).collect(),
             input_registers: (0..num_input).collect(),
+            files: HashMap::new(),
+            diagnostics: Diagnostics::default(),
         }
     }
 }
@@ -26,17 +196,30 @@ impl ModbusData {
 #[derive(Clone)]
 pub struct ModbusService {
     data: Arc<tokio::sync::RwLock<ModbusData>>,
+    unit: u8,
+    verbose: bool,
+    peer: Option<String>,
 }
 
 impl ModbusService {
-    pub fn new(data: Arc<tokio::sync::RwLock<ModbusData>>) -> Self {
-        Self { data }
+    pub fn new(data: Arc<tokio::sync::RwLock<ModbusData>>, unit: u8, verbose: bool) -> Self {
+        Self {
+            data,
+            unit,
+            verbose,
+            peer: None,
+        }
+    }
+
+    fn with_peer(mut self, peer: String) -> Self {
+        self.peer = Some(peer);
+        self
     }
 }
 
 impl Service for ModbusService {
-    type Request = Request<'static>;
-    type Response = Response;
+    type Request = SlaveRequest<'static>;
+    type Response = Option<tokio_modbus::Response>;
     type Exception = ExceptionCode;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Exception>> + Send>,
@@ -44,106 +227,22 @@ impl Service for ModbusService {
 
     fn call(&self, req: Self::Request) -> Self::Future {
         let data = self.data.clone();
+        let unit = self.unit;
+        let verbose = self.verbose;
+        let peer = self.peer.clone();
         Box::pin(async move {
-            let mut data = data.write().await;
+            let SlaveRequest { slave, request } = req;
+            if slave != unit {
+                log_line(
+                    verbose,
+                    peer.as_deref(),
+                    &format!("Ignoring request for unit {slave} (server unit is {unit})"),
+                );
+                return Ok(None);
+            }
 
-            let response = match req {
-                Request::ReadCoils(addr, qty) => {
-                    // Note: We don't have access to client IP in the service layer
-                    println!("Read {qty} coil(s) starting at {addr}");
-                    let start = addr as usize;
-                    let end = start + qty as usize;
-                    if end <= data.coils.len() {
-                        let coils = data.coils[start..end].to_vec();
-                        Response::ReadCoils(coils)
-                    } else {
-                        return Err(ExceptionCode::IllegalDataAddress);
-                    }
-                }
-                Request::ReadDiscreteInputs(addr, qty) => {
-                    println!("Read {qty} discrete input(s) starting at {addr}");
-                    let start = addr as usize;
-                    let end = start + qty as usize;
-                    if end <= data.discrete_inputs.len() {
-                        let inputs = data.discrete_inputs[start..end].to_vec();
-                        Response::ReadDiscreteInputs(inputs)
-                    } else {
-                        return Err(ExceptionCode::IllegalDataAddress);
-                    }
-                }
-                Request::ReadHoldingRegisters(addr, qty) => {
-                    println!("Read {qty} holding register(s) starting at {addr}");
-                    let start = addr as usize;
-                    let end = start + qty as usize;
-                    if end <= data.holding_registers.len() {
-                        let registers = data.holding_registers[start..end].to_vec();
-                        Response::ReadHoldingRegisters(registers)
-                    } else {
-                        return Err(ExceptionCode::IllegalDataAddress);
-                    }
-                }
-                Request::ReadInputRegisters(addr, qty) => {
-                    println!("Read {qty} input register(s) starting at {addr}");
-                    let start = addr as usize;
-                    let end = start + qty as usize;
-                    if end <= data.input_registers.len() {
-                        let registers = data.input_registers[start..end].to_vec();
-                        Response::ReadInputRegisters(registers)
-                    } else {
-                        return Err(ExceptionCode::IllegalDataAddress);
-                    }
-                }
-                Request::WriteSingleCoil(addr, value) => {
-                    let addr = addr as usize;
-                    if addr < data.coils.len() {
-                        println!("Write coil {addr}: {value}");
-                        data.coils[addr] = value;
-                        Response::WriteSingleCoil(addr as u16, value)
-                    } else {
-                        return Err(ExceptionCode::IllegalDataAddress);
-                    }
-                }
-                Request::WriteSingleRegister(addr, value) => {
-                    let addr = addr as usize;
-                    if addr < data.holding_registers.len() {
-                        println!("Write register {addr}: {value}");
-                        data.holding_registers[addr] = value;
-                        Response::WriteSingleRegister(addr as u16, value)
-                    } else {
-                        return Err(ExceptionCode::IllegalDataAddress);
-                    }
-                }
-                Request::WriteMultipleCoils(addr, values) => {
-                    let start = addr as usize;
-                    let end = start + values.len();
-                    if end <= data.coils.len() {
-                        println!("Write {} coils starting at {addr}", values.len());
-                        for (i, &value) in values.iter().enumerate() {
-                            data.coils[start + i] = value;
-                        }
-                        Response::WriteMultipleCoils(addr, values.len() as u16)
-                    } else {
-                        return Err(ExceptionCode::IllegalDataAddress);
-                    }
-                }
-                Request::WriteMultipleRegisters(addr, values) => {
-                    let start = addr as usize;
-                    let end = start + values.len();
-                    if end <= data.holding_registers.len() {
-                        println!("Write {} registers starting at {addr}", values.len());
-                        for (i, &value) in values.iter().enumerate() {
-                            data.holding_registers[start + i] = value;
-                        }
-                        Response::WriteMultipleRegisters(addr, values.len() as u16)
-                    } else {
-                        return Err(ExceptionCode::IllegalDataAddress);
-                    }
-                }
-                _ => {
-                    return Err(ExceptionCode::IllegalFunction);
-                }
-            };
-            Ok(response)
+            let mut data = data.write().await;
+            crate::handle::handle_request(&mut data, request, verbose, peer.as_deref(), unit)
         })
     }
 }
@@ -151,23 +250,46 @@ impl Service for ModbusService {
 pub async fn run_tcp_server(
     ip_addr: IpAddr,
     port: u16,
+    runtime: ServerRuntime,
     data: Arc<tokio::sync::RwLock<ModbusData>>,
 ) -> anyhow::Result<()> {
     let socket_addr = SocketAddr::new(ip_addr, port);
-    let listener = tokio::net::TcpListener::bind(socket_addr).await?;
+    let listener = match timeout(
+        Duration::from_secs(runtime.timeout_secs),
+        tokio::net::TcpListener::bind(socket_addr),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            eprintln!(
+                "Binding {ip_addr}:{port} timed out after {} seconds",
+                runtime.timeout_secs
+            );
+            return Err(anyhow::anyhow!("Connection timeout"));
+        }
+    };
     println!("Modbus TCP server listening on {ip_addr}:{port}");
     println!("Press Ctrl+C to stop the server");
 
     let server = Server::new(listener);
-    let service = ModbusService::new(data);
+    let ServerRuntime {
+        unit,
+        verbose,
+        timeout_secs,
+    } = runtime;
+    let idle = Duration::from_secs(timeout_secs);
 
-    let on_connected = move |stream, socket_addr| {
-        let service = service.clone();
+    let on_connected = move |stream: tokio::net::TcpStream, socket_addr: SocketAddr| {
+        let data = data.clone();
         async move {
-            println!("Client connected: {socket_addr}");
-            tokio_modbus::server::tcp::accept_tcp_connection(stream, socket_addr, |_| {
-                Ok(Some(service.clone()))
-            })
+            if verbose {
+                println!("Client connected: {socket_addr}");
+            }
+            let service =
+                ModbusService::new(data, unit, verbose).with_peer(socket_addr.to_string());
+            let stream = IdleTimeoutStream::new(stream, idle);
+            Ok(Some((service, stream)))
         }
     };
 
@@ -199,6 +321,7 @@ pub async fn run_rtu_server(
     parity: &Parity,
     stop_bits: &StopBits,
     data_bits: &DataBits,
+    runtime: ServerRuntime,
     data: Arc<tokio::sync::RwLock<ModbusData>>,
 ) -> anyhow::Result<()> {
     println!("Serial Configuration:");
@@ -212,15 +335,20 @@ pub async fn run_rtu_server(
         .stop_bits((*stop_bits).into())
         .data_bits((*data_bits).into());
 
-    match tokio_serial::SerialStream::open(&builder) {
-        Ok(mut serial) => {
+    let opened = timeout(Duration::from_secs(runtime.timeout_secs), async {
+        tokio_serial::SerialStream::open(&builder)
+    })
+    .await;
+
+    match opened {
+        Ok(Ok(mut serial)) => {
             // Disable exclusive access for virtual ports
             if let Err(e) = serial.set_exclusive(false) {
                 println!("Warning: Could not disable exclusive access: {e}");
             }
 
             let rtu_server = rtu::Server::new(serial);
-            let service = ModbusService::new(data);
+            let service = ModbusService::new(data, runtime.unit, runtime.verbose);
             println!("Modbus RTU server listening on {}", device_path.display());
             println!("Press Ctrl+C to stop the server");
 
@@ -235,7 +363,7 @@ pub async fn run_rtu_server(
             println!("RTU server stopped");
             Ok(())
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!(
                 "Failed to open serial device {}: {}",
                 device_path.display(),
@@ -243,13 +371,26 @@ pub async fn run_rtu_server(
             );
             Err(e.into())
         }
+        Err(_) => {
+            eprintln!(
+                "Opening {} timed out after {} seconds",
+                device_path.display(),
+                runtime.timeout_secs
+            );
+            Err(anyhow::anyhow!("Connection timeout"))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tokio_modbus::prelude::{ExceptionCode, Request, Response};
+    use super::{server_listen, IdleTimeoutStream, ModbusData, ModbusService, ServerListen};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio_modbus::prelude::{ExceptionCode, Request, Response, SlaveRequest};
+    use tokio_modbus::server::Service;
 
     #[test]
     fn test_modbus_data_new() {
@@ -307,13 +448,13 @@ mod tests {
             data_lock.coils[2] = true;
         }
 
-        let service = ModbusService::new(data);
+        let service = ModbusService::new(data, 1, false);
         let request = Request::ReadCoils(0, 3);
 
-        let result = service.call(request).await;
+        let result = service.call(SlaveRequest { slave: 1, request }).await;
         assert!(result.is_ok());
 
-        if let Ok(Response::ReadCoils(coils)) = result {
+        if let Ok(Some(Response::ReadCoils(coils))) = result {
             assert_eq!(coils.len(), 3);
             assert!(coils[0]);
             assert!(!coils[1]);
@@ -326,12 +467,12 @@ mod tests {
     #[tokio::test]
     async fn test_modbus_service_read_coils_out_of_bounds() {
         let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(5, 5, 5, 5)));
-        let service = ModbusService::new(data);
+        let service = ModbusService::new(data, 1, false);
 
         // Try to read beyond available coils
         let request = Request::ReadCoils(3, 5); // starts at 3, wants 5 coils = addresses 3,4,5,6,7 but only 0-4 exist
 
-        let result = service.call(request).await;
+        let result = service.call(SlaveRequest { slave: 1, request }).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), ExceptionCode::IllegalDataAddress);
     }
@@ -339,14 +480,14 @@ mod tests {
     #[tokio::test]
     async fn test_modbus_service_read_holding_registers() {
         let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-        let service = ModbusService::new(data);
+        let service = ModbusService::new(data, 1, false);
 
         let request = Request::ReadHoldingRegisters(5, 3);
 
-        let result = service.call(request).await;
+        let result = service.call(SlaveRequest { slave: 1, request }).await;
         assert!(result.is_ok());
 
-        if let Ok(Response::ReadHoldingRegisters(registers)) = result {
+        if let Ok(Some(Response::ReadHoldingRegisters(registers))) = result {
             assert_eq!(registers.len(), 3);
             assert_eq!(registers[0], 5); // address 5 = value 5
             assert_eq!(registers[1], 6); // address 6 = value 6
@@ -359,14 +500,14 @@ mod tests {
     #[tokio::test]
     async fn test_modbus_service_write_single_coil() {
         let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-        let service = ModbusService::new(data.clone());
+        let service = ModbusService::new(data.clone(), 1, false);
 
         let request = Request::WriteSingleCoil(3, true);
 
-        let result = service.call(request).await;
+        let result = service.call(SlaveRequest { slave: 1, request }).await;
         assert!(result.is_ok());
 
-        if let Ok(Response::WriteSingleCoil(addr, value)) = result {
+        if let Ok(Some(Response::WriteSingleCoil(addr, value))) = result {
             assert_eq!(addr, 3);
             assert!(value);
         } else {
@@ -381,14 +522,14 @@ mod tests {
     #[tokio::test]
     async fn test_modbus_service_write_single_register() {
         let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-        let service = ModbusService::new(data.clone());
+        let service = ModbusService::new(data.clone(), 1, false);
 
         let request = Request::WriteSingleRegister(2, 12345);
 
-        let result = service.call(request).await;
+        let result = service.call(SlaveRequest { slave: 1, request }).await;
         assert!(result.is_ok());
 
-        if let Ok(Response::WriteSingleRegister(addr, value)) = result {
+        if let Ok(Some(Response::WriteSingleRegister(addr, value))) = result {
             assert_eq!(addr, 2);
             assert_eq!(value, 12345);
         } else {
@@ -403,15 +544,15 @@ mod tests {
     #[tokio::test]
     async fn test_modbus_service_write_multiple_coils() {
         let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-        let service = ModbusService::new(data.clone());
+        let service = ModbusService::new(data.clone(), 1, false);
 
         let values = [true, false, true];
         let request = Request::WriteMultipleCoils(1, values.to_vec().into());
 
-        let result = service.call(request).await;
+        let result = service.call(SlaveRequest { slave: 1, request }).await;
         assert!(result.is_ok());
 
-        if let Ok(Response::WriteMultipleCoils(addr, qty)) = result {
+        if let Ok(Some(Response::WriteMultipleCoils(addr, qty))) = result {
             assert_eq!(addr, 1);
             assert_eq!(qty, 3);
         } else {
@@ -423,5 +564,45 @@ mod tests {
         assert!(data_lock.coils[1]);
         assert!(!data_lock.coils[2]);
         assert!(data_lock.coils[3]);
+    }
+
+    #[tokio::test]
+    async fn test_modbus_service_ignores_other_unit_ids() {
+        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
+        let service = ModbusService::new(data.clone(), 1, false);
+        let request = Request::WriteSingleCoil(0, true);
+
+        let result = service
+            .call(SlaveRequest { slave: 2, request })
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        let data_lock = data.read().await;
+        assert!(!data_lock.coils[0]);
+    }
+
+    #[test]
+    fn test_server_listen_requires_one_transport() {
+        let ip = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            server_listen(Some(ip), None).unwrap(),
+            ServerListen::Tcp(ip)
+        );
+        assert_eq!(
+            server_listen(None, Some(PathBuf::from("/dev/ttyUSB0"))).unwrap(),
+            ServerListen::Rtu(PathBuf::from("/dev/ttyUSB0"))
+        );
+        assert!(server_listen(None, None).is_err());
+        assert!(server_listen(Some(ip), Some(PathBuf::from("/dev/ttyUSB0"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_closes_silent_stream() {
+        let (_client, server) = tokio::io::duplex(16);
+        let mut timed = IdleTimeoutStream::new(server, Duration::from_millis(30));
+        let mut buf = [0u8; 4];
+        let n = timed.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
     }
 }

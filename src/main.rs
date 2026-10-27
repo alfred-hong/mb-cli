@@ -1,15 +1,23 @@
 use std::sync::Arc;
 use tokio_modbus::client::{Reader, Writer};
 
+mod actions;
+mod address;
 mod cli;
 mod client;
+mod decode;
+mod handle;
+mod output;
 mod server;
 mod table;
 
+use actions::{ensure_write_coil_count, ensure_write_register_count, reject_readonly};
 use cli::{Cli, Command, ReadArea, WriteArea};
-use client::{connect_to_modbus, modbus_operation_with_timeout};
-use server::{run_rtu_server, run_tcp_server, ModbusData};
-use table::{print_coil_table, print_register_table};
+use client::{connect_to_modbus, each_read, modbus_operation_with_timeout, REQUEST_TIMEOUT_SECS};
+use server::{
+    run_rtu_server, run_tcp_server, server_listen, ModbusData, ServerListen, ServerRuntime,
+};
+use table::{print_coil_table, print_register_table, write_coil_table};
 
 use clap::Parser;
 
@@ -19,62 +27,134 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Command::Read { area } => match area {
-            ReadArea::Coil { start, qty, common } => {
+            ReadArea::Coil {
+                start,
+                qty,
+                common,
+                timing,
+            } => {
                 let mut client = connect_to_modbus(&common).await?;
-                let coils = modbus_operation_with_timeout(
-                    || client.read_coils(start, qty),
-                    "read coils",
-                    common.timeout,
-                )
+                each_read(timing.timeout, async || {
+                    let coils = modbus_operation_with_timeout(
+                        || client.read_coils(start, qty),
+                        "read coils",
+                        REQUEST_TIMEOUT_SECS,
+                    )
+                    .await?;
+                    let mut frame = format!(
+                        "Read {} coil(s) (Modbus address: {}):\n",
+                        coils.len(),
+                        common.unit
+                    );
+                    write_coil_table(&mut frame, &coils, start);
+                    Ok(frame)
+                })
                 .await?;
-                println!("Read {} coil(s) (Unit ID: {}):", coils.len(), common.unit);
-                print_coil_table(&coils, start);
             }
-            ReadArea::Discrete { start, qty, common } => {
+            ReadArea::Discrete {
+                start,
+                qty,
+                common,
+                timing,
+            } => {
                 let mut client = connect_to_modbus(&common).await?;
-                let inputs = modbus_operation_with_timeout(
-                    || client.read_discrete_inputs(start, qty),
-                    "read discrete inputs",
-                    common.timeout,
-                )
+                each_read(timing.timeout, async || {
+                    let inputs = modbus_operation_with_timeout(
+                        || client.read_discrete_inputs(start, qty),
+                        "read discrete inputs",
+                        REQUEST_TIMEOUT_SECS,
+                    )
+                    .await?;
+                    let mut frame = format!(
+                        "Read {} discrete input(s) (Modbus address: {}):\n",
+                        inputs.len(),
+                        common.unit
+                    );
+                    write_coil_table(&mut frame, &inputs, start);
+                    Ok(frame)
+                })
                 .await?;
-                println!(
-                    "Read {} discrete input(s) (Unit ID: {}):",
-                    inputs.len(),
-                    common.unit
-                );
-                print_coil_table(&inputs, start);
             }
-            ReadArea::Holding { start, qty, common } => {
+            ReadArea::Holding {
+                start,
+                qty,
+                decode,
+                common,
+                timing,
+            } => {
                 let mut client = connect_to_modbus(&common).await?;
-                let registers = modbus_operation_with_timeout(
-                    || client.read_holding_registers(start, qty),
-                    "read holding registers",
-                    common.timeout,
-                )
+                each_read(timing.timeout, async || {
+                    let registers = modbus_operation_with_timeout(
+                        || client.read_holding_registers(start, qty),
+                        "read holding registers",
+                        REQUEST_TIMEOUT_SECS,
+                    )
+                    .await?;
+                    let mut frame = format!(
+                        "Read {} holding register(s) (Modbus address: {}):\n",
+                        registers.len(),
+                        common.unit
+                    );
+                    decode::write_words(&mut frame, &registers, start, common.verbose, &decode)?;
+                    Ok(frame)
+                })
                 .await?;
-                println!(
-                    "Read {} holding register(s) (Unit ID: {}):",
-                    registers.len(),
-                    common.unit
-                );
-                print_register_table(&registers, start, common.verbose);
             }
-            ReadArea::Input { start, qty, common } => {
+            ReadArea::Input {
+                start,
+                qty,
+                decode,
+                common,
+                timing,
+            } => {
                 let mut client = connect_to_modbus(&common).await?;
-                let registers = modbus_operation_with_timeout(
-                    || client.read_input_registers(start, qty),
-                    "read input registers",
-                    common.timeout,
-                )
+                each_read(timing.timeout, async || {
+                    let registers = modbus_operation_with_timeout(
+                        || client.read_input_registers(start, qty),
+                        "read input registers",
+                        REQUEST_TIMEOUT_SECS,
+                    )
+                    .await?;
+                    let mut frame = format!(
+                        "Read {} input register(s) (Modbus address: {}):\n",
+                        registers.len(),
+                        common.unit
+                    );
+                    decode::write_words(&mut frame, &registers, start, common.verbose, &decode)?;
+                    Ok(frame)
+                })
                 .await?;
-                println!(
-                    "Read {} input register(s) (Unit ID: {}):",
-                    registers.len(),
-                    common.unit
-                );
-                print_register_table(&registers, start, common.verbose);
             }
+            ReadArea::ExceptionStatus { common, timing } => {
+                actions::read_exception_status(&common, timing.timeout).await?
+            }
+            ReadArea::EventCounter { common, timing } => {
+                actions::read_event_counter(&common, timing.timeout).await?
+            }
+            ReadArea::EventLog { common, timing } => {
+                actions::read_event_log(&common, timing.timeout).await?
+            }
+            ReadArea::ServerId { common, timing } => {
+                actions::read_server_id(&common, timing.timeout).await?
+            }
+            ReadArea::Fifo {
+                start,
+                decode,
+                common,
+                timing,
+            } => actions::read_fifo(&common, start, &decode, timing.timeout).await?,
+            ReadArea::File {
+                groups,
+                decode,
+                common,
+                timing,
+            } => actions::read_file(&common, &groups, &decode, timing.timeout).await?,
+            ReadArea::DeviceId {
+                code,
+                object,
+                common,
+                timing,
+            } => actions::read_device_id(&common, code, object, timing.timeout).await?,
         },
 
         Command::Write { area } => match area {
@@ -83,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
                 values,
                 common,
             } => {
+                ensure_write_coil_count(values.len())?;
                 let mut client = connect_to_modbus(&common).await?;
 
                 // Convert u16 values to bool values (0 = false, non-zero = true)
@@ -93,11 +174,11 @@ async fn main() -> anyhow::Result<()> {
                     modbus_operation_with_timeout(
                         || client.write_single_coil(start, bool_values[0]),
                         "write coil",
-                        common.timeout,
+                        REQUEST_TIMEOUT_SECS,
                     )
                     .await?;
                     println!(
-                        "Wrote coil at address {start} with value {} (Unit ID: {})",
+                        "Wrote coil at address {start} with value {} (Modbus address: {})",
                         if bool_values[0] { "ON" } else { "OFF" },
                         common.unit
                     );
@@ -106,11 +187,11 @@ async fn main() -> anyhow::Result<()> {
                     modbus_operation_with_timeout(
                         || client.write_multiple_coils(start, &bool_values),
                         "write coils",
-                        common.timeout,
+                        REQUEST_TIMEOUT_SECS,
                     )
                     .await?;
                     println!(
-                        "Wrote {} coil(s) starting at address {} (Unit ID: {})",
+                        "Wrote {} coil(s) starting at address {} (Modbus address: {})",
                         bool_values.len(),
                         start,
                         common.unit
@@ -123,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
                 values,
                 common,
             } => {
+                ensure_write_register_count(values.len())?;
                 let mut client = connect_to_modbus(&common).await?;
 
                 if values.len() == 1 {
@@ -130,17 +212,17 @@ async fn main() -> anyhow::Result<()> {
                     modbus_operation_with_timeout(
                         || client.write_single_register(start, values[0]),
                         "write register",
-                        common.timeout,
+                        REQUEST_TIMEOUT_SECS,
                     )
                     .await?;
                     if common.verbose {
                         println!(
-                            "Wrote holding register at address {} with value {} (0x{:04X}) (Unit ID: {})",
+                            "Wrote holding register at address {} with value {} (0x{:04X}) (Modbus address: {})",
                             start, values[0], values[0], common.unit
                         );
                     } else {
                         println!(
-                            "Wrote holding register at address {} with value {} (Unit ID: {})",
+                            "Wrote holding register at address {} with value {} (Modbus address: {})",
                             start, values[0], common.unit
                         );
                     }
@@ -149,11 +231,11 @@ async fn main() -> anyhow::Result<()> {
                     modbus_operation_with_timeout(
                         || client.write_multiple_registers(start, &values),
                         "write registers",
-                        common.timeout,
+                        REQUEST_TIMEOUT_SECS,
                     )
                     .await?;
                     println!(
-                        "Wrote {} holding register(s) starting at address {} (Unit ID: {})",
+                        "Wrote {} holding register(s) starting at address {} (Modbus address: {})",
                         values.len(),
                         start,
                         common.unit
@@ -161,7 +243,35 @@ async fn main() -> anyhow::Result<()> {
                     print_register_table(&values, start, common.verbose);
                 }
             }
+            WriteArea::Mask {
+                start,
+                and_mask,
+                or_mask,
+                common,
+            } => actions::write_mask(&common, start, and_mask, or_mask).await?,
+            WriteArea::File { groups, common } => actions::write_file(&common, &groups).await?,
+            WriteArea::Discrete { .. } => {
+                return Err(reject_readonly(
+                    "Discrete inputs (1XXXX)",
+                    "mb read discrete",
+                ));
+            }
+            WriteArea::Input { .. } => {
+                return Err(reject_readonly("Input registers (3XXXX)", "mb read input"));
+            }
         },
+
+        Command::Diagnostics { sub, data, common } => {
+            actions::diagnostics(&common, sub, data).await?;
+        }
+        Command::ReadWrite {
+            read_addr,
+            read_qty,
+            start,
+            values,
+            decode,
+            common,
+        } => actions::read_write(&common, read_addr, read_qty, start, &values, &decode).await?,
 
         Command::Server {
             ip,
@@ -171,15 +281,15 @@ async fn main() -> anyhow::Result<()> {
             parity,
             stop_bits,
             data_bits,
-            unit: _,
+            unit,
+            timeout,
             num_coils,
             num_discrete,
             num_holding,
             num_input,
-            verbose: _,
+            verbose,
         } => {
-            // Auto-detect TCP vs RTU based on arguments
-            // Create shared data storage
+            let listen = server_listen(ip, device)?;
             let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(
                 num_coils,
                 num_discrete,
@@ -187,58 +297,57 @@ async fn main() -> anyhow::Result<()> {
                 num_input,
             )));
 
-            // Print common configuration
             let print_config = || {
                 println!("Configuration:");
+                println!("  Modbus address: {unit}");
+                println!("  Timeout: {timeout}s");
                 println!(
-                    "  Coils: {} (addresses 0-{})",
+                    "  Coils: {} (addresses 0-{}), initial value OFF",
                     num_coils,
                     num_coils.saturating_sub(1)
                 );
                 println!(
-                    "  Discrete Inputs: {} (addresses 0-{})",
+                    "  Discrete Inputs: {} (addresses 0-{}), initial value OFF",
                     num_discrete,
                     num_discrete.saturating_sub(1)
                 );
                 println!(
-                    "  Holding Registers: {} (addresses 0-{})",
+                    "  Holding Registers: {} (addresses 0-{}), initial value equals the address",
                     num_holding,
                     num_holding.saturating_sub(1)
                 );
                 println!(
-                    "  Input Registers: {} (addresses 0-{})",
+                    "  Input Registers: {} (addresses 0-{}), initial value equals the address",
                     num_input,
                     num_input.saturating_sub(1)
                 );
-                println!("  Initialization: Each address value equals its address");
                 println!();
             };
 
-            match (ip, device) {
-                (Some(ip_addr), None) => {
-                    // TCP Server
+            let runtime = ServerRuntime {
+                unit,
+                verbose,
+                timeout_secs: timeout,
+            };
+            match listen {
+                ServerListen::Tcp(ip_addr) => {
                     println!("Starting Modbus TCP server on {ip_addr}:{port}");
                     print_config();
-                    run_tcp_server(ip_addr, port, data).await?;
+                    run_tcp_server(ip_addr, port, runtime, data).await?;
                 }
-                (None, Some(device_path)) => {
-                    // RTU Server
+                ServerListen::Rtu(device_path) => {
                     println!("Starting Modbus RTU server on {}", device_path.display());
                     print_config();
-                    run_rtu_server(&device_path, baud, &parity, &stop_bits, &data_bits, data)
-                        .await?;
-                }
-                (None, None) => {
-                    // Default to TCP on 0.0.0.0:502
-                    use std::net::{IpAddr, Ipv4Addr};
-                    let ip_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
-                    println!("Starting Modbus TCP server on {ip_addr}:{port} (default)");
-                    print_config();
-                    run_tcp_server(ip_addr, port, data).await?;
-                }
-                (Some(_), Some(_)) => {
-                    // This should be prevented by clap conflicts
-                    return Err(anyhow::anyhow!("Cannot specify both --ip and --device"));
+                    run_rtu_server(
+                        &device_path,
+                        baud,
+                        &parity,
+                        &stop_bits,
+                        &data_bits,
+                        runtime,
+                        data,
+                    )
+                    .await?;
                 }
             }
         }
