@@ -1,14 +1,16 @@
-use crate::cli::Common;
+use crate::cli::{Common, ReadTiming};
+use anyhow::Context as _;
+use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::net::SocketAddr;
+use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration, Instant};
 use tokio_modbus::client;
 use tokio_modbus::prelude::*;
 
-/// Bound for opening a connection and for one Modbus request.
+/// Default bound for opening a connection and for one Modbus request.
 pub const REQUEST_TIMEOUT_SECS: u64 = 5;
-
-/// Gap between samples while `--timeout` keeps a read repeating.
-const READ_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How many times a read command runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,33 +40,137 @@ impl ReadWindow {
             Self::For(limit) => elapsed < limit,
         }
     }
+
+    fn repeating(self) -> bool {
+        !matches!(self, Self::Once)
+    }
+}
+
+/// Turn one sample into the text that is drawn. A repeating scan keeps an error on screen.
+pub fn present_sample(
+    window: ReadWindow,
+    result: Result<String, anyhow::Error>,
+    requests: u32,
+    valid: u32,
+) -> Result<String, anyhow::Error> {
+    match result {
+        Ok(mut frame) => {
+            if window.repeating() {
+                push_counts(&mut frame, requests, valid);
+            }
+            Ok(frame)
+        }
+        Err(err) if window.repeating() => {
+            let mut frame = format!("{err}\n");
+            push_counts(&mut frame, requests, valid);
+            Ok(frame)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn push_counts(frame: &mut String, requests: u32, valid: u32) {
+    if !frame.ends_with('\n') {
+        frame.push('\n');
+    }
+    let _ = writeln!(frame, "requests={requests} valid={valid}");
+}
+
+/// One scan compressed onto a single log line.
+pub fn log_record(stamp: &str, frame: &str) -> String {
+    let body = frame.lines().collect::<Vec<_>>().join(" | ");
+    format!("{stamp}\t{body}")
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` from seconds since 1970-01-01 UTC.
+pub fn utc_stamp(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let time_of_day = unix_secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_of_day / 3_600;
+    let minute = (time_of_day % 3_600) / 60;
+    let second = time_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Howard Hinnant's `civil_from_days`. `days` is the count since 1970-01-01.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let day_of_year = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = if month_part < 10 {
+        month_part + 3
+    } else {
+        month_part - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year as i32, month as u32, day as u32)
+}
+
+fn now_stamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    utc_stamp(seconds)
 }
 
 /// Run `read_once` once, for `--timeout` seconds, or until interrupted.
 ///
-/// `read_once` returns the text of one sample. Samples after the first wait until
-/// one second has passed since the previous sample started. On a terminal, each
-/// later sample replaces the previous one. A finite window still ends on its deadline.
+/// Samples after the first wait until `--interval` has passed since the previous
+/// sample started. On a terminal, each later sample replaces the previous one.
+/// A failed sample during a repeating scan is drawn and the scan continues.
+/// `--log` appends one line per sample, without the request counters.
 pub async fn each_read(
-    timeout_secs: Option<i64>,
+    timing: &ReadTiming,
     mut read_once: impl AsyncFnMut() -> anyhow::Result<String>,
 ) -> anyhow::Result<()> {
-    let window = ReadWindow::from_seconds(timeout_secs);
+    let window = ReadWindow::from_seconds(timing.timeout);
+    let interval = Duration::from_millis(timing.interval_ms);
+    let mut log = match &timing.log {
+        Some(path) => Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening {}", path.display()))?,
+        ),
+        None => None,
+    };
     let started = Instant::now();
     let mut index = 0u32;
+    let mut requests = 0u32;
+    let mut valid = 0u32;
     let mut drawn = 0usize;
     loop {
         if !window.allows(started.elapsed(), index) {
             return Ok(());
         }
         let tick = Instant::now();
-        let frame = read_once().await?;
+        let result = read_once().await;
+        requests += 1;
+        if result.is_ok() {
+            valid += 1;
+        }
+        if let Some(file) = log.as_mut() {
+            if let Ok(frame) = result.as_ref() {
+                writeln!(file, "{}", log_record(&now_stamp(), frame))?;
+            } else if let Err(err) = result.as_ref() {
+                writeln!(file, "{}", log_record(&now_stamp(), &format!("{err}\n")))?;
+            }
+        }
+        let frame = present_sample(window, result, requests, valid)?;
         drawn = crate::output::paint(drawn, &frame)?;
         index += 1;
         if matches!(window, ReadWindow::Once) {
             return Ok(());
         }
-        let mut gap = READ_INTERVAL.saturating_sub(tick.elapsed());
+        let mut gap = interval.saturating_sub(tick.elapsed());
         if let ReadWindow::For(limit) = window {
             let remaining = limit.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -90,11 +196,12 @@ pub async fn connect_to_modbus(common: &Common) -> anyhow::Result<client::Contex
                 );
             }
 
-            let connect_timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
-            match timeout(connect_timeout, client::tcp::connect(socket_addr)).await {
+            let connect_timeout = Duration::from_secs(common.response_timeout);
+            match timeout(connect_timeout, TcpStream::connect(socket_addr)).await {
                 Ok(connect_result) => match connect_result {
-                    Ok(mut ctx) => {
-                        ctx.set_slave(Slave(common.unit));
+                    Ok(stream) => {
+                        let stream = crate::trace::Trace::new(stream, common.verbose);
+                        let ctx = client::tcp::attach_slave(stream, Slave(common.unit));
                         if common.verbose {
                             println!(
                                 "Successfully connected to Modbus TCP server at {ip}:{}",
@@ -111,7 +218,7 @@ pub async fn connect_to_modbus(common: &Common) -> anyhow::Result<client::Contex
                 Err(_) => {
                     eprintln!(
                         "Connection to {ip}:{} timed out after {} seconds",
-                        common.port, REQUEST_TIMEOUT_SECS
+                        common.port, common.response_timeout
                     );
                     Err(anyhow::anyhow!("Connection timeout"))
                 }
@@ -131,7 +238,7 @@ pub async fn connect_to_modbus(common: &Common) -> anyhow::Result<client::Contex
                 );
             }
 
-            let connect_timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
+            let connect_timeout = Duration::from_secs(common.response_timeout);
             match timeout(connect_timeout, async {
                 let builder = tokio_serial::new(device.to_string_lossy(), common.baud)
                     .parity(common.parity.into())
@@ -149,6 +256,7 @@ pub async fn connect_to_modbus(common: &Common) -> anyhow::Result<client::Contex
                                 println!("Warning: Could not disable exclusive access: {e}");
                             }
                         }
+                        let serial = crate::trace::Trace::new(serial, common.verbose);
                         let ctx = client::rtu::attach_slave(serial, Slave(common.unit));
                         if common.verbose {
                             println!(
@@ -167,7 +275,7 @@ pub async fn connect_to_modbus(common: &Common) -> anyhow::Result<client::Contex
                     eprintln!(
                         "Connection to {} timed out after {} seconds",
                         device.display(),
-                        REQUEST_TIMEOUT_SECS
+                        common.response_timeout
                     );
                     Err(anyhow::anyhow!("Connection timeout"))
                 }
@@ -229,6 +337,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ReadTiming;
     use tokio_modbus::prelude::ExceptionCode;
 
     #[test]
@@ -328,13 +437,47 @@ mod tests {
     #[tokio::test]
     async fn omitted_timeout_reads_once() {
         let mut count = 0;
-        each_read(None, async || {
+        let timing = ReadTiming {
+            timeout: None,
+            interval_ms: 1000,
+            log: None,
+        };
+        each_read(&timing, async || {
             count += 1;
             Ok(String::from("sample\n"))
         })
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_scan_keeps_an_error_and_counts_valid_replies() {
+        let err = present_sample(
+            ReadWindow::For(Duration::from_secs(2)),
+            Err(anyhow::anyhow!("no reply")),
+            2,
+            1,
+        );
+        let frame = err.expect("scan continues");
+        assert!(frame.contains("no reply"), "{frame}");
+        assert!(frame.contains("requests=2 valid=1"), "{frame}");
+
+        let stopped = present_sample(ReadWindow::Once, Err(anyhow::anyhow!("no reply")), 1, 0);
+        assert!(stopped.is_err());
+    }
+
+    #[test]
+    fn log_record_is_one_line() {
+        let line = log_record("2026-10-28T00:00:00Z", "Read 1\n0        7\n");
+        assert_eq!(line, "2026-10-28T00:00:00Z\tRead 1 | 0        7");
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn utc_stamp_formats_the_epoch() {
+        assert_eq!(utc_stamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_stamp(86_400), "1970-01-02T00:00:00Z");
     }
 
     // Test timeout configuration ranges

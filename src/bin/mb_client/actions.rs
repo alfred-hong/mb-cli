@@ -1,10 +1,8 @@
-use crate::address::{FileReadGroup, FileWriteGroup};
-use crate::cli::{Common, DecodeArgs, DeviceIdCode};
-use crate::client::{
-    connect_to_modbus, each_read, modbus_operation_with_timeout, REQUEST_TIMEOUT_SECS,
-};
+use crate::cli::{AddressNotation, Common, DecodeArgs, DeviceIdCode, ReadTiming};
+use crate::client::{connect_to_modbus, each_read, modbus_operation_with_timeout};
 use crate::decode;
-use crate::table::print_register_table;
+use crate::table::{print_register_table, AddressStyle};
+use mb_cli::address::{FileReadGroup, FileWriteGroup};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use tokio_modbus::client::Context;
@@ -34,19 +32,26 @@ pub fn ensure_read_write_count(count: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn area_style(notation: AddressNotation, prefix: u8) -> AddressStyle {
+    match notation {
+        AddressNotation::Pdu => AddressStyle::Pdu,
+        AddressNotation::Modicon => AddressStyle::Modicon(prefix),
+    }
+}
+
 pub fn reject_readonly(area: &str, command: &str) -> anyhow::Error {
     anyhow::anyhow!("{area} are read-only. Read them with `{command}`.")
 }
 
-pub async fn read_exception_status(common: &Common, timeout: Option<i64>) -> anyhow::Result<()> {
+pub async fn read_exception_status(common: &Common, timing: &ReadTiming) -> anyhow::Result<()> {
     let mut client = connect_to_modbus(common).await?;
-    each_read(timeout, async || {
+    each_read(timing, async || {
         let response = call_custom(
             &mut client,
             0x07,
             &[],
             "read exception status",
-            REQUEST_TIMEOUT_SECS,
+            common.response_timeout,
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -66,15 +71,15 @@ pub async fn read_exception_status(common: &Common, timeout: Option<i64>) -> any
     .await
 }
 
-pub async fn read_event_counter(common: &Common, timeout: Option<i64>) -> anyhow::Result<()> {
+pub async fn read_event_counter(common: &Common, timing: &ReadTiming) -> anyhow::Result<()> {
     let mut client = connect_to_modbus(common).await?;
-    each_read(timeout, async || {
+    each_read(timing, async || {
         let response = call_custom(
             &mut client,
             0x0B,
             &[],
             "read event counter",
-            REQUEST_TIMEOUT_SECS,
+            common.response_timeout,
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -90,15 +95,15 @@ pub async fn read_event_counter(common: &Common, timeout: Option<i64>) -> anyhow
     .await
 }
 
-pub async fn read_event_log(common: &Common, timeout: Option<i64>) -> anyhow::Result<()> {
+pub async fn read_event_log(common: &Common, timing: &ReadTiming) -> anyhow::Result<()> {
     let mut client = connect_to_modbus(common).await?;
-    each_read(timeout, async || {
+    each_read(timing, async || {
         let response = call_custom(
             &mut client,
             0x0C,
             &[],
             "read event log",
-            REQUEST_TIMEOUT_SECS,
+            common.response_timeout,
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -126,13 +131,13 @@ pub async fn read_event_log(common: &Common, timeout: Option<i64>) -> anyhow::Re
     .await
 }
 
-pub async fn read_server_id(common: &Common, timeout: Option<i64>) -> anyhow::Result<()> {
+pub async fn read_server_id(common: &Common, timing: &ReadTiming) -> anyhow::Result<()> {
     let mut client = connect_to_modbus(common).await?;
-    each_read(timeout, async || {
+    each_read(timing, async || {
         let response = modbus_operation_with_timeout(
             || client.call(Request::ReportServerId),
             "report server id",
-            REQUEST_TIMEOUT_SECS,
+            common.response_timeout,
         )
         .await?;
         let Response::ReportServerId(id, running, extra) = response else {
@@ -159,16 +164,16 @@ pub async fn read_fifo(
     common: &Common,
     addr: u16,
     decode_options: &DecodeArgs,
-    timeout: Option<i64>,
+    timing: &ReadTiming,
 ) -> anyhow::Result<()> {
     let mut client = connect_to_modbus(common).await?;
-    each_read(timeout, async || {
+    each_read(timing, async || {
         let response = call_custom(
             &mut client,
             0x18,
             &addr.to_be_bytes(),
             "read fifo",
-            REQUEST_TIMEOUT_SECS,
+            common.response_timeout,
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -190,6 +195,7 @@ pub async fn read_fifo(
             data_addr,
             common.verbose,
             decode_options,
+            area_style(common.notation, 4),
         )?;
         Ok(frame)
     })
@@ -200,17 +206,17 @@ pub async fn read_file(
     common: &Common,
     groups: &[FileReadGroup],
     decode_options: &DecodeArgs,
-    timeout: Option<i64>,
+    timing: &ReadTiming,
 ) -> anyhow::Result<()> {
     let payload = encode_file_read(groups)?;
     let mut client = connect_to_modbus(common).await?;
-    each_read(timeout, async || {
+    each_read(timing, async || {
         let response = call_custom(
             &mut client,
             0x14,
             &payload,
             "read file record",
-            REQUEST_TIMEOUT_SECS,
+            common.response_timeout,
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -227,14 +233,14 @@ pub async fn read_device_id(
     common: &Common,
     code: DeviceIdCode,
     object: u8,
-    timeout: Option<i64>,
+    timing: &ReadTiming,
 ) -> anyhow::Result<()> {
     let mut client = connect_to_modbus(common).await?;
-    each_read(timeout, async || {
+    each_read(timing, async || {
         let response = modbus_operation_with_timeout(
             || client.read_device_identification(code.read_code(), object),
             "read device identification",
-            REQUEST_TIMEOUT_SECS,
+            common.response_timeout,
         )
         .await?;
         let mut frame = format!(
@@ -292,7 +298,7 @@ pub async fn write_mask(
     modbus_operation_with_timeout(
         || client.masked_write_register(addr, and_mask, or_mask),
         "mask write register",
-        REQUEST_TIMEOUT_SECS,
+        common.response_timeout,
     )
     .await?;
     println!(
@@ -323,7 +329,12 @@ pub async fn write_file(common: &Common, groups: &[FileWriteGroup]) -> anyhow::R
             group.record,
             group.values.len()
         );
-        print_register_table(&group.values, group.record, common.verbose);
+        print_register_table(
+            &group.values,
+            group.record,
+            common.verbose,
+            AddressStyle::Pdu,
+        );
     }
     Ok(())
 }
@@ -341,7 +352,7 @@ pub async fn read_write(
     let registers = modbus_operation_with_timeout(
         || client.read_write_multiple_registers(read_addr, read_qty, write_addr, values),
         "read/write registers",
-        REQUEST_TIMEOUT_SECS,
+        common.response_timeout,
     )
     .await?;
     println!(
@@ -350,13 +361,178 @@ pub async fn read_write(
         registers.len(),
         common.unit
     );
-    decode::print_words(&registers, read_addr, common.verbose, decode_options)?;
+    decode::print_words(
+        &registers,
+        read_addr,
+        common.verbose,
+        decode_options,
+        area_style(common.notation, 4),
+    )?;
     Ok(())
+}
+
+/// Build a typed request when the codec decodes that function, so the codes match.
+fn request_from_raw(function: u8, data: &[u8]) -> anyhow::Result<Request<'static>> {
+    match function {
+        0x01 => {
+            expect_len(data, 4, function)?;
+            Ok(Request::ReadCoils(word_at(data, 0)?, word_at(data, 2)?))
+        }
+        0x02 => {
+            expect_len(data, 4, function)?;
+            Ok(Request::ReadDiscreteInputs(
+                word_at(data, 0)?,
+                word_at(data, 2)?,
+            ))
+        }
+        0x03 => {
+            expect_len(data, 4, function)?;
+            Ok(Request::ReadHoldingRegisters(
+                word_at(data, 0)?,
+                word_at(data, 2)?,
+            ))
+        }
+        0x04 => {
+            expect_len(data, 4, function)?;
+            Ok(Request::ReadInputRegisters(
+                word_at(data, 0)?,
+                word_at(data, 2)?,
+            ))
+        }
+        0x05 => {
+            expect_len(data, 4, function)?;
+            let coil = match word_at(data, 2)? {
+                0xFF00 => true,
+                0x0000 => false,
+                other => anyhow::bail!("coil value must be FF00 or 0000, got {other:04X}"),
+            };
+            Ok(Request::WriteSingleCoil(word_at(data, 0)?, coil))
+        }
+        0x06 => {
+            expect_len(data, 4, function)?;
+            Ok(Request::WriteSingleRegister(
+                word_at(data, 0)?,
+                word_at(data, 2)?,
+            ))
+        }
+        0x0F => {
+            let address = word_at(data, 0)?;
+            let quantity = word_at(data, 2)?;
+            let packed = counted_tail(data, function)?;
+            Ok(Request::WriteMultipleCoils(
+                address,
+                Cow::Owned(unpack_coils(packed, quantity)),
+            ))
+        }
+        0x10 => {
+            let address = word_at(data, 0)?;
+            let packed = counted_tail(data, function)?;
+            Ok(Request::WriteMultipleRegisters(
+                address,
+                Cow::Owned(words_from(packed)?),
+            ))
+        }
+        0x11 => {
+            expect_len(data, 0, function)?;
+            Ok(Request::ReportServerId)
+        }
+        0x16 => {
+            expect_len(data, 6, function)?;
+            Ok(Request::MaskWriteRegister(
+                word_at(data, 0)?,
+                word_at(data, 2)?,
+                word_at(data, 4)?,
+            ))
+        }
+        0x17 => {
+            let read_address = word_at(data, 0)?;
+            let read_quantity = word_at(data, 2)?;
+            let write_address = word_at(data, 4)?;
+            let byte_count =
+                usize::from(*data.get(8).ok_or_else(|| {
+                    anyhow::anyhow!("function 23 expects a byte count at offset 8")
+                })?);
+            let packed = data.get(9..9 + byte_count).ok_or_else(|| {
+                anyhow::anyhow!("function 23 byte count {byte_count} does not match the PDU")
+            })?;
+            if data.len() != 9 + byte_count {
+                anyhow::bail!("function 23 PDU has trailing bytes");
+            }
+            Ok(Request::ReadWriteMultipleRegisters(
+                read_address,
+                read_quantity,
+                write_address,
+                Cow::Owned(words_from(packed)?),
+            ))
+        }
+        other => Ok(Request::Custom(other, Cow::Owned(data.to_vec()))),
+    }
+}
+
+fn expect_len(data: &[u8], len: usize, function: u8) -> anyhow::Result<()> {
+    if data.len() == len {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "function {function} expects {len} PDU bytes, got {}",
+            data.len()
+        )
+    }
+}
+
+fn counted_tail(data: &[u8], function: u8) -> anyhow::Result<&[u8]> {
+    let byte_count = usize::from(
+        *data
+            .get(4)
+            .ok_or_else(|| anyhow::anyhow!("function {function} expects a byte count"))?,
+    );
+    let tail = data.get(5..5 + byte_count).ok_or_else(|| {
+        anyhow::anyhow!("function {function} byte count {byte_count} does not match the PDU")
+    })?;
+    if data.len() != 5 + byte_count {
+        anyhow::bail!("function {function} PDU has trailing bytes");
+    }
+    Ok(tail)
+}
+
+fn words_from(bytes: &[u8]) -> anyhow::Result<Vec<u16>> {
+    if bytes.len() % 2 != 0 {
+        anyhow::bail!("register data must be a whole number of words");
+    }
+    Ok(bytes
+        .chunks(2)
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect())
+}
+
+fn unpack_coils(bytes: &[u8], quantity: u16) -> Vec<bool> {
+    (0..quantity)
+        .map(|index| {
+            let index = usize::from(index);
+            let byte = bytes.get(index / 8).copied().unwrap_or(0);
+            (byte >> (index % 8)) & 1 == 1
+        })
+        .collect()
+}
+
+/// Send one function code. `data` is the PDU after that code.
+pub async fn raw_request(common: &Common, function: u8, data: &[u8]) -> anyhow::Result<Response> {
+    if !(1..128).contains(&function) {
+        anyhow::bail!("function code must be 1-127");
+    }
+    let request = request_from_raw(function, data)?;
+    let mut client = connect_to_modbus(common).await?;
+    modbus_operation_with_timeout(
+        || client.call(request),
+        "raw request",
+        common.response_timeout,
+    )
+    .await
 }
 
 async fn custom(common: &Common, code: u8, bytes: &[u8], name: &str) -> anyhow::Result<Response> {
     let mut client = connect_to_modbus(common).await?;
-    call_custom(&mut client, code, bytes, name, REQUEST_TIMEOUT_SECS).await
+    call_custom(&mut client, code, bytes, name, common.response_timeout).await
 }
 
 async fn call_custom(
@@ -448,7 +624,14 @@ fn write_file_read(
             "Group {}: file {file}, record {record}, reference type {reference}",
             index + 1
         );
-        decode::write_words(out, &values, record, verbose, decode_options)?;
+        decode::write_words(
+            out,
+            &values,
+            record,
+            verbose,
+            decode_options,
+            AddressStyle::Pdu,
+        )?;
         offset += 1 + sub_len;
         index += 1;
     }
@@ -512,5 +695,16 @@ fn object_name(id: u8) -> &'static str {
         0x05 => "ModelName",
         0x06 => "UserApplicationName",
         _ => "Object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_holding_read_uses_the_typed_request() {
+        let request = request_from_raw(3, &[0x00, 0x00, 0x00, 0x01]).unwrap();
+        assert!(matches!(request, Request::ReadHoldingRegisters(0, 1)));
     }
 }

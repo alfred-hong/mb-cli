@@ -1,62 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use mb_cli::serial::{DataBits, Parity, StopBits};
 use std::{net::IpAddr, path::PathBuf};
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum Parity {
-    None,
-    Even,
-    Odd,
-}
-
-impl From<Parity> for tokio_serial::Parity {
-    fn from(parity: Parity) -> Self {
-        match parity {
-            Parity::None => tokio_serial::Parity::None,
-            Parity::Even => tokio_serial::Parity::Even,
-            Parity::Odd => tokio_serial::Parity::Odd,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum StopBits {
-    #[value(name = "1")]
-    One,
-    #[value(name = "2")]
-    Two,
-}
-
-impl From<StopBits> for tokio_serial::StopBits {
-    fn from(stop_bits: StopBits) -> Self {
-        match stop_bits {
-            StopBits::One => tokio_serial::StopBits::One,
-            StopBits::Two => tokio_serial::StopBits::Two,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum DataBits {
-    #[value(name = "5")]
-    Five,
-    #[value(name = "6")]
-    Six,
-    #[value(name = "7")]
-    Seven,
-    #[value(name = "8")]
-    Eight,
-}
-
-impl From<DataBits> for tokio_serial::DataBits {
-    fn from(data_bits: DataBits) -> Self {
-        match data_bits {
-            DataBits::Five => tokio_serial::DataBits::Five,
-            DataBits::Six => tokio_serial::DataBits::Six,
-            DataBits::Seven => tokio_serial::DataBits::Seven,
-            DataBits::Eight => tokio_serial::DataBits::Eight,
-        }
-    }
-}
 
 // Custom validation functions for Modbus specification limits
 fn validate_coil_qty(s: &str) -> Result<u16, String> {
@@ -85,6 +29,41 @@ fn validate_register_qty(s: &str) -> Result<u16, String> {
     } else {
         Ok(qty)
     }
+}
+
+fn parse_function_code(text: &str) -> Result<u8, String> {
+    let value = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16)
+    } else {
+        text.parse()
+    }
+    .map_err(|_| format!("function code '{text}' must be 1-127"))?;
+    if (1..128).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("function code '{text}' must be 1-127"))
+    }
+}
+
+/// Bytes after a function code. Empty text is an empty payload.
+pub fn parse_hex_payload(text: &str) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for token in text.split(|character: char| character.is_whitespace() || character == ',') {
+        if token.is_empty() {
+            continue;
+        }
+        let hex = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+            .unwrap_or(token);
+        if hex.is_empty() || hex.len() > 2 {
+            anyhow::bail!("PDU byte '{token}' must be one hex byte");
+        }
+        let value = u8::from_str_radix(hex, 16)
+            .map_err(|_| anyhow::anyhow!("PDU byte '{token}' is not hex"))?;
+        bytes.push(value);
+    }
+    Ok(bytes)
 }
 
 /// Flags common to every subcommand
@@ -128,19 +107,44 @@ pub struct Common {
     )]
     pub unit: u8,
 
-    /// Verbose output
-    #[arg(long, short, display_order = 10)]
+    /// Seconds to wait for the connection and for each response. This is separate from `--timeout`.
+    #[arg(
+        long = "response-timeout",
+        default_value_t = crate::client::REQUEST_TIMEOUT_SECS,
+        value_name = "SECONDS",
+        display_order = 9
+    )]
+    pub response_timeout: u64,
+
+    /// Address column. `pdu` prints the protocol address. `modicon` prints 00001, 10001, 30001, or 40001.
+    #[arg(long, value_enum, default_value = "pdu", display_order = 10)]
+    pub notation: AddressNotation,
+
+    /// Verbose output. Also prints each transmitted and received frame in hex.
+    #[arg(long, short, display_order = 11)]
     pub verbose: bool,
+}
+
+/// How addresses are printed. Input still accepts decimal, `0x`, and area references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum AddressNotation {
+    /// Protocol address, starting at 0.
+    #[default]
+    #[value(name = "pdu")]
+    Pdu,
+    /// Classic area reference: coils 0XXXX, discrete inputs 1XXXX, input registers 3XXXX, holding registers 4XXXX.
+    #[value(name = "modicon")]
+    Modicon,
 }
 
 /// CLI entry point
 #[derive(Parser, Debug)]
 #[command(
-    name = "mb",
+    name = "mb_client",
     author,
     version,
-    about = "Modbus TCP client and server",
-    after_help = "EXAMPLES:\n    mb read holding --ip 127.0.0.1 --port 502 --unit 1\n    mb read holding --ip 127.0.0.1 --unit 40001 --addr 1\n    mb read coil --ip 192.168.1.100 --unit 0x10 --qty 8\n    mb write holding --ip 127.0.0.1 --unit 100 --value 0x2A\n    mb write coil --ip 127.0.0.1 --unit 0 --value 1,0,1,1\n    mb server --ip 0.0.0.0 --port 502"
+    about = "Modbus TCP and RTU client",
+    after_help = "EXAMPLES:\n    mb_client read holding --ip 127.0.0.1 --port 502 --unit 1\n    mb_client read holding --ip 127.0.0.1 --unit 40001 --addr 1\n    mb_client read coil --ip 192.168.1.100 --unit 0x10 --qty 8\n    mb_client write holding --ip 127.0.0.1 --unit 100 --value 0x2A\n    mb_client write coil --ip 127.0.0.1 --unit 0 --value 1,0,1,1"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -231,14 +235,27 @@ pub enum RegisterOrder {
 /// How long a read command keeps requesting.
 #[derive(Debug, Clone, clap::Args)]
 pub struct ReadTiming {
-    /// Seconds to keep reading. Omit to read once. A positive value repeats until that many seconds have passed. `0` or a negative value repeats until interrupted. Each sample replaces the previous one.
+    /// Seconds to keep reading. Omit to read once. A positive value repeats until that many seconds have passed. `0` or a negative value repeats until interrupted. Each sample replaces the previous one. A failed sample stays on screen and the scan continues.
     #[arg(
         long,
         value_name = "SECONDS",
         allow_hyphen_values = true,
-        display_order = 9
+        display_order = 12
     )]
     pub timeout: Option<i64>,
+
+    /// Milliseconds from the start of one sample to the start of the next. `0` sends the next request as soon as the previous one finishes.
+    #[arg(
+        long = "interval",
+        default_value_t = 1000,
+        value_name = "MILLISECONDS",
+        display_order = 13
+    )]
+    pub interval_ms: u64,
+
+    /// Append one line per sample. An error is written in place of the values.
+    #[arg(long, value_name = "FILE", display_order = 14)]
+    pub log: Option<PathBuf>,
 }
 
 /// Options that reinterpret a register read.
@@ -284,12 +301,24 @@ pub enum Command {
 
     /// Diagnostics (FC 08). Defined for serial lines; this server also answers it on TCP.
     Diagnostics {
-        /// Sub-function name or number. See `mb diagnostics --help`.
-        #[arg(long, value_parser = crate::address::parse_diagnostic_sub)]
+        /// Sub-function name or number. See `mb_client diagnostics --help`.
+        #[arg(long, value_parser = mb_cli::address::parse_diagnostic_sub)]
         sub: u16,
         /// Data word, decimal or 0x hex. Restart uses 0xFF00 to clear counters.
-        #[arg(long, default_value = "0", value_parser = crate::address::parse_word)]
+        #[arg(long, default_value = "0", value_parser = mb_cli::address::parse_word)]
         data: u16,
+        #[command(flatten)]
+        common: Common,
+    },
+
+    /// Send one function code and print the response. ModScan calls this a user command.
+    Raw {
+        /// Function code, 1-127.
+        #[arg(long, value_parser = parse_function_code)]
+        function: u8,
+        /// Bytes after the function code. Hex bytes separated by commas or spaces, such as `00,00,00,01`.
+        #[arg(long, default_value = "")]
+        data: String,
         #[command(flatten)]
         common: Common,
     },
@@ -297,13 +326,13 @@ pub enum Command {
     /// Write holding registers, then read holding registers (FC 23)
     ReadWrite {
         /// Register to read: decimal PDU, 0x hex, or a 4XXXX holding reference
-        #[arg(long = "read-unit", value_parser = crate::address::parse_holding_address)]
+        #[arg(long = "read-unit", value_parser = mb_cli::address::parse_holding_address)]
         read_addr: u16,
         /// Read quantity (1-125)
         #[arg(long = "read-qty", default_value_t = 1, value_parser = validate_register_qty)]
         read_qty: u16,
         /// Register to write: decimal PDU, 0x hex, or a 4XXXX holding reference
-        #[arg(long = "unit", value_parser = crate::address::parse_holding_address)]
+        #[arg(long = "unit", value_parser = mb_cli::address::parse_holding_address)]
         start: u16,
         /// Values to write before the read (1-121 words, decimal or 0x hex)
         #[arg(
@@ -311,78 +340,13 @@ pub enum Command {
             value_delimiter = ',',
             num_args = 1..,
             required = true,
-            value_parser = crate::address::parse_word
+            value_parser = mb_cli::address::parse_word
         )]
         values: Vec<u16>,
         #[command(flatten)]
         decode: DecodeArgs,
         #[command(flatten)]
         common: Common,
-    },
-
-    /// Run a Modbus server
-    Server {
-        /// IP address to bind to (TCP only)
-        #[arg(long, value_parser = clap::value_parser!(IpAddr), conflicts_with = "device", display_order = 1)]
-        ip: Option<IpAddr>,
-
-        /// Port to listen on (TCP only)
-        #[arg(long, default_value_t = 502, display_order = 2)]
-        port: u16,
-
-        /// Serial device path (RTU only)
-        #[arg(long, conflicts_with = "ip", display_order = 3)]
-        device: Option<PathBuf>,
-
-        /// Baud rate for serial communication (RTU only)
-        #[arg(long, default_value_t = 9600, display_order = 4)]
-        baud: u32,
-
-        /// Parity for serial communication (RTU only)
-        #[arg(long, value_enum, default_value = "none", display_order = 5)]
-        parity: Parity,
-
-        /// Stop bits for serial communication (RTU only)
-        #[arg(long, value_enum, default_value = "1", display_order = 6)]
-        stop_bits: StopBits,
-
-        /// Data bits for serial communication (RTU only)
-        #[arg(long, value_enum, default_value = "8", display_order = 7)]
-        data_bits: DataBits,
-
-        /// Modbus station address. The server answers only this id. `--addr` is the same flag.
-        #[arg(
-            long = "modbus_address",
-            visible_alias = "addr",
-            value_name = "ADDRESS",
-            default_value_t = 1,
-            display_order = 8
-        )]
-        unit: u8,
-
-        /// Timeout for binding, opening the serial port, and idle TCP connections, in seconds
-        #[arg(long, default_value_t = 5, display_order = 9)]
-        timeout: u64,
-
-        /// Number of coils (0-65535)
-        #[arg(long, default_value_t = 10000, display_order = 10)]
-        num_coils: u16,
-
-        /// Number of discrete inputs (0-65535)
-        #[arg(long, default_value_t = 10000, display_order = 11)]
-        num_discrete: u16,
-
-        /// Number of holding registers (0-65535)
-        #[arg(long, default_value_t = 10000, display_order = 12)]
-        num_holding: u16,
-
-        /// Number of input registers (0-65535)
-        #[arg(long, default_value_t = 10000, display_order = 13)]
-        num_input: u16,
-
-        /// Verbose logging
-        #[arg(long, short, display_order = 14)]
-        verbose: bool,
     },
 }
 
@@ -392,7 +356,7 @@ pub enum ReadArea {
     #[command(visible_alias = "discrete-output", visible_alias = "0xxxx")]
     Coil {
         /// PDU address (decimal or 0x hex) or a 0XXXX reference. 00001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = crate::address::parse_coil_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_coil_address)]
         start: u16,
         /// Quantity (default 1, max 2000)
         #[arg(long = "qty", default_value_t = 1, value_parser = validate_coil_qty, display_order = 6)]
@@ -406,7 +370,7 @@ pub enum ReadArea {
     #[command(visible_alias = "discrete-input", visible_alias = "1xxxx")]
     Discrete {
         /// PDU address (decimal or 0x hex) or a 1XXXX reference. 10001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = crate::address::parse_discrete_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_discrete_address)]
         start: u16,
         /// Quantity (default 1, max 2000)
         #[arg(long = "qty", default_value_t = 1, value_parser = validate_coil_qty, display_order = 6)]
@@ -420,7 +384,7 @@ pub enum ReadArea {
     #[command(visible_alias = "holding-register", visible_alias = "4xxxx")]
     Holding {
         /// PDU address (decimal or 0x hex) or a 4XXXX reference. 40001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = crate::address::parse_holding_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address)]
         start: u16,
         /// Quantity (default 1, max 125)
         #[arg(long = "qty", default_value_t = 1, value_parser = validate_register_qty, display_order = 6)]
@@ -436,7 +400,7 @@ pub enum ReadArea {
     #[command(visible_alias = "input-register", visible_alias = "3xxxx")]
     Input {
         /// PDU address (decimal or 0x hex) or a 3XXXX reference. 30001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = crate::address::parse_input_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_input_address)]
         start: u16,
         /// Quantity (default 1, max 125)
         #[arg(long = "qty", default_value_t = 1, value_parser = validate_register_qty, display_order = 6)]
@@ -479,7 +443,7 @@ pub enum ReadArea {
     /// Read a FIFO queue (FC 24). The holding register at `--unit` holds the count.
     Fifo {
         /// FIFO pointer: decimal PDU, 0x hex, or a 4XXXX holding reference
-        #[arg(long = "unit", value_name = "UNIT", value_parser = crate::address::parse_holding_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address)]
         start: u16,
         #[command(flatten)]
         decode: DecodeArgs,
@@ -496,9 +460,9 @@ pub enum ReadArea {
             value_name = "FILE:RECORD:LENGTH",
             num_args = 1..,
             required = true,
-            value_parser = crate::address::parse_file_read_group
+            value_parser = mb_cli::address::parse_file_read_group
         )]
-        groups: Vec<crate::address::FileReadGroup>,
+        groups: Vec<mb_cli::address::FileReadGroup>,
         #[command(flatten)]
         decode: DecodeArgs,
         #[command(flatten)]
@@ -527,7 +491,7 @@ pub enum WriteArea {
     #[command(visible_alias = "discrete-output", visible_alias = "0xxxx")]
     Coil {
         /// PDU address (decimal or 0x hex) or a 0XXXX reference. 00001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = crate::address::parse_coil_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_coil_address)]
         start: u16,
         /// Value(s): 0=OFF, non-zero=ON. Decimal or 0x hex, comma-separated.
         #[arg(
@@ -535,7 +499,7 @@ pub enum WriteArea {
             value_delimiter = ',',
             num_args = 1..,
             required = true,
-            value_parser = crate::address::parse_word
+            value_parser = mb_cli::address::parse_word
         )]
         values: Vec<u16>,
         #[command(flatten)]
@@ -545,7 +509,7 @@ pub enum WriteArea {
     #[command(visible_alias = "holding-register", visible_alias = "4xxxx")]
     Holding {
         /// PDU address (decimal or 0x hex) or a 4XXXX reference. 40001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = crate::address::parse_holding_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address)]
         start: u16,
         /// Value(s), decimal or 0x hex, comma-separated. At most 123 words.
         #[arg(
@@ -553,7 +517,7 @@ pub enum WriteArea {
             value_delimiter = ',',
             num_args = 1..,
             required = true,
-            value_parser = crate::address::parse_word
+            value_parser = mb_cli::address::parse_word
         )]
         values: Vec<u16>,
         #[command(flatten)]
@@ -562,13 +526,13 @@ pub enum WriteArea {
     /// Mask-write one holding register (FC 22): `(current AND and) OR (or AND NOT and)`
     Mask {
         /// PDU address (decimal or 0x hex) or a 4XXXX reference
-        #[arg(long = "unit", value_name = "UNIT", value_parser = crate::address::parse_holding_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address)]
         start: u16,
         /// AND mask, decimal or 0x hex
-        #[arg(long = "and", value_parser = crate::address::parse_word)]
+        #[arg(long = "and", value_parser = mb_cli::address::parse_word)]
         and_mask: u16,
         /// OR mask, decimal or 0x hex
-        #[arg(long = "or", value_parser = crate::address::parse_word)]
+        #[arg(long = "or", value_parser = mb_cli::address::parse_word)]
         or_mask: u16,
         #[command(flatten)]
         common: Common,
@@ -581,21 +545,33 @@ pub enum WriteArea {
             value_name = "FILE:RECORD:VALUES",
             num_args = 1..,
             required = true,
-            value_parser = crate::address::parse_file_write_group
+            value_parser = mb_cli::address::parse_file_write_group
         )]
-        groups: Vec<crate::address::FileWriteGroup>,
+        groups: Vec<mb_cli::address::FileWriteGroup>,
         #[command(flatten)]
         common: Common,
     },
     /// Discrete inputs are read-only (FC 02, area 1XXXX)
     #[command(visible_alias = "discrete-input", visible_alias = "1xxxx")]
     Discrete {
+        /// PDU address or a 1XXXX reference. The write is rejected either way.
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_discrete_address)]
+        start: Option<u16>,
+        /// Values are not written. Discrete inputs stay read-only.
+        #[arg(long = "value")]
+        values: Option<String>,
         #[command(flatten)]
         common: Common,
     },
     /// Input registers are read-only (FC 04, area 3XXXX)
     #[command(visible_alias = "input-register", visible_alias = "3xxxx")]
     Input {
+        /// PDU address or a 3XXXX reference. The write is rejected either way.
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_input_address)]
+        start: Option<u16>,
+        /// Values are not written. Input registers stay read-only.
+        #[arg(long = "value")]
+        values: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -670,61 +646,40 @@ mod tests {
         command.write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
 
-        assert!(help.contains("mb read coil "));
-        assert!(!help.contains("mb read coils"));
-        assert!(help.contains("mb write coil "));
-        assert!(!help.contains("mb write coils"));
+        assert!(help.contains("mb_client read coil "));
+        assert!(!help.contains("mb_client read coils"));
+        assert!(help.contains("mb_client write coil "));
+        assert!(!help.contains("mb_client write coils"));
     }
 
     #[test]
     fn test_read_area_names_are_singular() {
-        assert!(
-            Cli::try_parse_from(["mb", "read", "coils", "--ip", "127.0.0.1", "--unit", "0"])
-                .is_err()
-        );
-        assert!(
-            Cli::try_parse_from(["mb", "read", "coil", "--ip", "127.0.0.1", "--unit", "0"]).is_ok()
-        );
-    }
-
-    #[test]
-    fn test_server_parses_unit_timeout_and_verbose() {
-        let cli = Cli::try_parse_from([
-            "mb",
-            "server",
+        assert!(Cli::try_parse_from([
+            "mb_client",
+            "read",
+            "coils",
             "--ip",
             "127.0.0.1",
-            "--modbus_address",
-            "7",
-            "--timeout",
-            "12",
-            "-v",
+            "--unit",
+            "0"
         ])
-        .unwrap();
-
-        match cli.cmd {
-            Command::Server {
-                unit,
-                timeout,
-                verbose,
-                ip,
-                device,
-                ..
-            } => {
-                assert_eq!(unit, 7);
-                assert_eq!(timeout, 12);
-                assert!(verbose);
-                assert_eq!(ip.unwrap().to_string(), "127.0.0.1");
-                assert!(device.is_none());
-            }
-            other => panic!("expected server command, got {other:?}"),
-        }
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "mb_client",
+            "read",
+            "coil",
+            "--ip",
+            "127.0.0.1",
+            "--unit",
+            "0"
+        ])
+        .is_ok());
     }
 
     #[test]
     fn addresses_accept_hex_and_area_references() {
         let cli = Cli::try_parse_from([
-            "mb",
+            "mb_client",
             "read",
             "holding-register",
             "--ip",
@@ -740,9 +695,16 @@ mod tests {
             other => panic!("expected holding read, got {other:?}"),
         }
 
-        let cli =
-            Cli::try_parse_from(["mb", "read", "0xxxx", "--ip", "127.0.0.1", "--unit", "0x10"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "mb_client",
+            "read",
+            "0xxxx",
+            "--ip",
+            "127.0.0.1",
+            "--unit",
+            "0x10",
+        ])
+        .unwrap();
         match cli.cmd {
             Command::Read {
                 area: ReadArea::Coil { start, .. },
@@ -751,7 +713,7 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from([
-            "mb",
+            "mb_client",
             "read",
             "coil",
             "--ip",
@@ -760,14 +722,14 @@ mod tests {
             "40001",
         ])
         .is_err());
-        assert!(Cli::try_parse_from(["mb", "write", "discrete"]).is_ok());
-        assert!(Cli::try_parse_from(["mb", "write", "input-register"]).is_ok());
+        assert!(Cli::try_parse_from(["mb_client", "write", "discrete"]).is_ok());
+        assert!(Cli::try_parse_from(["mb_client", "write", "input-register"]).is_ok());
     }
 
     #[test]
     fn decode_flags_select_format_order_and_byte_swap() {
         let cli = Cli::try_parse_from([
-            "mb",
+            "mb_client",
             "read",
             "input",
             "--ip",
@@ -808,7 +770,15 @@ mod tests {
     }
 
     fn read_timeout(args: &[&str]) -> Option<i64> {
-        let mut command = vec!["mb", "read", "holding", "--ip", "127.0.0.1", "--unit", "0"];
+        let mut command = vec![
+            "mb_client",
+            "read",
+            "holding",
+            "--ip",
+            "127.0.0.1",
+            "--unit",
+            "0",
+        ];
         command.extend_from_slice(args);
         let cli = Cli::try_parse_from(command).unwrap();
         match cli.cmd {
@@ -825,5 +795,51 @@ mod tests {
         assert_eq!(read_timeout(&["--timeout", "10"]), Some(10));
         assert_eq!(read_timeout(&["--timeout", "0"]), Some(0));
         assert_eq!(read_timeout(&["--timeout", "-1"]), Some(-1));
+    }
+
+    #[test]
+    fn scan_flags_default_to_one_second_and_pdu_addresses() {
+        let cli = Cli::try_parse_from([
+            "mb_client",
+            "read",
+            "holding",
+            "--ip",
+            "127.0.0.1",
+            "--unit",
+            "0",
+            "--interval",
+            "250",
+            "--notation",
+            "modicon",
+            "--response-timeout",
+            "2",
+            "--log",
+            "scan.log",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Command::Read {
+                area: ReadArea::Holding { timing, common, .. },
+            } => {
+                assert_eq!(timing.interval_ms, 250);
+                assert_eq!(
+                    timing.log.as_deref(),
+                    Some(std::path::Path::new("scan.log"))
+                );
+                assert_eq!(common.response_timeout, 2);
+                assert_eq!(common.notation, AddressNotation::Modicon);
+            }
+            other => panic!("expected holding read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hex_payload_accepts_spaces_commas_and_prefixes() {
+        assert_eq!(parse_hex_payload("").unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            parse_hex_payload("00,00 0x00,01").unwrap(),
+            vec![0, 0, 0, 1]
+        );
+        assert!(parse_hex_payload("0100").is_err());
     }
 }

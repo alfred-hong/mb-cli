@@ -1,4 +1,4 @@
-use crate::server::{log_line, ModbusData};
+use crate::server::ModbusData;
 use tokio_modbus::bytes::Bytes;
 use tokio_modbus::prelude::*;
 
@@ -9,25 +9,22 @@ const FILE_REFERENCE_TYPE: u8 = 6;
 pub(crate) fn handle_request(
     data: &mut ModbusData,
     request: Request<'static>,
-    verbose: bool,
-    peer: Option<&str>,
     unit: u8,
 ) -> Result<Option<Response>, ExceptionCode> {
     if data.diagnostics.listen_only && !is_restart(&request) {
         data.diagnostics.no_response_count = data.diagnostics.no_response_count.saturating_add(1);
-        log_line(verbose, peer, "Listen only: no response");
         return Ok(None);
     }
 
     if is_restart(&request) {
-        return restart_communications(data, &request, verbose, peer);
+        return restart_communications(data, &request);
     }
 
     data.diagnostics.message_count = data.diagnostics.message_count.saturating_add(1);
     data.diagnostics.server_message_count = data.diagnostics.server_message_count.saturating_add(1);
     push_event(data, 0x80);
 
-    let outcome = dispatch(data, &request, verbose, peer, unit);
+    let outcome = dispatch(data, &request, unit);
     match &outcome {
         Ok(Some(_)) => {
             if counts_event(&request) {
@@ -49,70 +46,41 @@ pub(crate) fn handle_request(
 fn dispatch(
     data: &mut ModbusData,
     request: &Request<'static>,
-    verbose: bool,
-    peer: Option<&str>,
     unit: u8,
 ) -> Result<Option<Response>, ExceptionCode> {
     let response = match request {
         Request::ReadCoils(addr, qty) => {
-            log_line(
-                verbose,
-                peer,
-                &format!("Read {qty} coil(s) starting at {addr}"),
-            );
             check_qty(*qty, 1, 2000)?;
             let range = span(*addr, *qty, data.coils.len())?;
             Response::ReadCoils(data.coils[range].to_vec())
         }
         Request::ReadDiscreteInputs(addr, qty) => {
-            log_line(
-                verbose,
-                peer,
-                &format!("Read {qty} discrete input(s) starting at {addr}"),
-            );
             check_qty(*qty, 1, 2000)?;
             let range = span(*addr, *qty, data.discrete_inputs.len())?;
             Response::ReadDiscreteInputs(data.discrete_inputs[range].to_vec())
         }
         Request::ReadHoldingRegisters(addr, qty) => {
-            log_line(
-                verbose,
-                peer,
-                &format!("Read {qty} holding register(s) starting at {addr}"),
-            );
             check_qty(*qty, 1, 125)?;
             let range = span(*addr, *qty, data.holding_registers.len())?;
             Response::ReadHoldingRegisters(data.holding_registers[range].to_vec())
         }
         Request::ReadInputRegisters(addr, qty) => {
-            log_line(
-                verbose,
-                peer,
-                &format!("Read {qty} input register(s) starting at {addr}"),
-            );
             check_qty(*qty, 1, 125)?;
             let range = span(*addr, *qty, data.input_registers.len())?;
             Response::ReadInputRegisters(data.input_registers[range].to_vec())
         }
         Request::WriteSingleCoil(addr, value) => {
-            log_line(verbose, peer, &format!("Write coil {addr}: {value}"));
             let index = single_index(*addr, data.coils.len())?;
             data.coils[index] = *value;
             Response::WriteSingleCoil(*addr, *value)
         }
         Request::WriteSingleRegister(addr, value) => {
-            log_line(verbose, peer, &format!("Write register {addr}: {value}"));
             let index = single_index(*addr, data.holding_registers.len())?;
             data.holding_registers[index] = *value;
             Response::WriteSingleRegister(*addr, *value)
         }
         Request::WriteMultipleCoils(addr, values) => {
             let qty = u16::try_from(values.len()).map_err(|_| ExceptionCode::IllegalDataValue)?;
-            log_line(
-                verbose,
-                peer,
-                &format!("Write {qty} coils starting at {addr}"),
-            );
             check_qty(qty, 1, 0x07B0)?;
             let range = span(*addr, qty, data.coils.len())?;
             for (slot, value) in data.coils[range].iter_mut().zip(values.iter()) {
@@ -122,11 +90,6 @@ fn dispatch(
         }
         Request::WriteMultipleRegisters(addr, values) => {
             let qty = u16::try_from(values.len()).map_err(|_| ExceptionCode::IllegalDataValue)?;
-            log_line(
-                verbose,
-                peer,
-                &format!("Write {qty} registers starting at {addr}"),
-            );
             check_qty(qty, 1, 123)?;
             let range = span(*addr, qty, data.holding_registers.len())?;
             for (slot, value) in data.holding_registers[range].iter_mut().zip(values.iter()) {
@@ -135,11 +98,6 @@ fn dispatch(
             Response::WriteMultipleRegisters(*addr, qty)
         }
         Request::MaskWriteRegister(addr, and_mask, or_mask) => {
-            log_line(
-                verbose,
-                peer,
-                &format!("Mask write register {addr}: AND {and_mask:#06X} OR {or_mask:#06X}"),
-            );
             let index = single_index(*addr, data.holding_registers.len())?;
             let current = data.holding_registers[index];
             data.holding_registers[index] = (current & and_mask) | (or_mask & !and_mask);
@@ -148,13 +106,6 @@ fn dispatch(
         Request::ReadWriteMultipleRegisters(read_addr, read_qty, write_addr, words) => {
             let write_qty =
                 u16::try_from(words.len()).map_err(|_| ExceptionCode::IllegalDataValue)?;
-            log_line(
-                verbose,
-                peer,
-                &format!(
-                    "Read {read_qty} registers at {read_addr} and write {write_qty} at {write_addr}"
-                ),
-            );
             check_qty(*read_qty, 1, 125)?;
             check_qty(write_qty, 1, 0x0079)?;
             let read_range = span(*read_addr, *read_qty, data.holding_registers.len())?;
@@ -168,7 +119,6 @@ fn dispatch(
             Response::ReadWriteMultipleRegisters(data.holding_registers[read_range].to_vec())
         }
         Request::ReportServerId => {
-            log_line(verbose, peer, "Report server ID");
             // tokio-modbus sizes this typed response one byte short of what it encodes,
             // so the TCP length field would truncate the last byte. A custom PDU keeps
             // the length and the encoded bytes in agreement.
@@ -183,48 +133,34 @@ fn dispatch(
         }
         Request::ReadDeviceIdentification(code, object_id) => {
             let code_value = code.value();
-            log_line(
-                verbose,
-                peer,
-                &format!("Read device identification code {code_value} object {object_id}"),
-            );
             let payload = device_identification_payload(code_value, *object_id)?;
             Response::Custom(0x2B, Bytes::from(payload))
         }
         Request::Custom(0x07, bytes) if bytes.is_empty() => {
-            log_line(verbose, peer, "Read exception status");
             Response::Custom(0x07, Bytes::from(vec![exception_status(data)]))
         }
         Request::Custom(0x08, bytes) => {
             let (sub, word) = words(bytes)?;
-            log_line(verbose, peer, &format!("Diagnostics sub {sub:#06X}"));
             let response_word = diagnostics(data, sub, word)?;
             if data.diagnostics.listen_only {
                 return Ok(None);
             }
             Response::Custom(0x08, Bytes::from(word_pair(sub, response_word)))
         }
-        Request::Custom(0x0B, bytes) if bytes.is_empty() => {
-            log_line(verbose, peer, "Get comm event counter");
-            Response::Custom(
-                0x0B,
-                Bytes::from(word_pair(0x0000, data.diagnostics.event_count)),
-            )
-        }
+        Request::Custom(0x0B, bytes) if bytes.is_empty() => Response::Custom(
+            0x0B,
+            Bytes::from(word_pair(0x0000, data.diagnostics.event_count)),
+        ),
         Request::Custom(0x0C, bytes) if bytes.is_empty() => {
-            log_line(verbose, peer, "Get comm event log");
             Response::Custom(0x0C, Bytes::from(event_log(data)))
         }
         Request::Custom(0x14, bytes) => {
-            log_line(verbose, peer, "Read file record");
             Response::Custom(0x14, Bytes::from(read_file(data, bytes)?))
         }
         Request::Custom(0x15, bytes) => {
-            log_line(verbose, peer, "Write file record");
             Response::Custom(0x15, Bytes::from(write_file(data, bytes)?))
         }
         Request::Custom(0x18, bytes) => {
-            log_line(verbose, peer, "Read FIFO queue");
             Response::Custom(0x18, Bytes::from(read_fifo(data, bytes)?))
         }
         Request::Custom(_, _) => return Err(ExceptionCode::IllegalFunction),
@@ -322,18 +258,11 @@ fn diagnostics(data: &mut ModbusData, sub: u16, word: u16) -> Result<u16, Except
 fn restart_communications(
     data: &mut ModbusData,
     request: &Request<'static>,
-    verbose: bool,
-    peer: Option<&str>,
 ) -> Result<Option<Response>, ExceptionCode> {
     let Request::Custom(_, bytes) = request else {
         return Err(ExceptionCode::IllegalFunction);
     };
-    let (sub, word) = words(bytes)?;
-    log_line(
-        verbose,
-        peer,
-        &format!("Restart communications sub {sub:#06X}"),
-    );
+    let (_, word) = words(bytes)?;
     data.diagnostics.listen_only = false;
     if word == 0xFF00 {
         clear_counters(data);
@@ -606,6 +535,65 @@ fn device_objects() -> Vec<(u8, &'static [u8])> {
     ]
 }
 
+/// A write request changes coils, holding registers, or file records.
+pub(crate) fn is_write(request: &Request<'_>) -> bool {
+    matches!(
+        request,
+        Request::WriteSingleCoil(_, _)
+            | Request::WriteSingleRegister(_, _)
+            | Request::WriteMultipleCoils(_, _)
+            | Request::WriteMultipleRegisters(_, _)
+            | Request::MaskWriteRegister(_, _, _)
+            | Request::ReadWriteMultipleRegisters(_, _, _, _)
+            | Request::Custom(0x15, _)
+    )
+}
+
+/// One verbose line: station, function, start address, quantity, and outcome.
+pub(crate) fn summarize(
+    station: u8,
+    request: &Request<'_>,
+    outcome: &Result<Option<Response>, ExceptionCode>,
+) -> String {
+    let function = request.function_code().value();
+    let (addr, qty) = request_span(request);
+    let addr = addr
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let qty = qty
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let result = match outcome {
+        Ok(Some(_)) => "ok".to_string(),
+        Ok(None) => "no-response".to_string(),
+        Err(code) => format!("exception 0x{:02X}", u8::from(*code)),
+    };
+    format!("station={station} fc=0x{function:02X} addr={addr} qty={qty} result={result}")
+}
+
+fn request_span(request: &Request<'_>) -> (Option<u16>, Option<u16>) {
+    match request {
+        Request::ReadCoils(addr, qty)
+        | Request::ReadDiscreteInputs(addr, qty)
+        | Request::ReadHoldingRegisters(addr, qty)
+        | Request::ReadInputRegisters(addr, qty) => (Some(*addr), Some(*qty)),
+        Request::WriteSingleCoil(addr, _)
+        | Request::WriteSingleRegister(addr, _)
+        | Request::MaskWriteRegister(addr, _, _) => (Some(*addr), Some(1)),
+        Request::WriteMultipleCoils(addr, values) => {
+            (Some(*addr), u16::try_from(values.len()).ok())
+        }
+        Request::WriteMultipleRegisters(addr, values) => {
+            (Some(*addr), u16::try_from(values.len()).ok())
+        }
+        Request::ReadWriteMultipleRegisters(addr, qty, _, _) => (Some(*addr), Some(*qty)),
+        Request::Custom(0x18, bytes) if bytes.len() >= 2 => {
+            (Some(u16::from_be_bytes([bytes[0], bytes[1]])), None)
+        }
+        _ => (None, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,8 +606,7 @@ mod tests {
     #[test]
     fn quantity_zero_is_illegal_data_value() {
         let mut data = data();
-        let error =
-            handle_request(&mut data, Request::ReadCoils(0, 0), false, None, 1).unwrap_err();
+        let error = handle_request(&mut data, Request::ReadCoils(0, 0), 1).unwrap_err();
         assert_eq!(error, ExceptionCode::IllegalDataValue);
     }
 
@@ -627,15 +614,9 @@ mod tests {
     fn mask_write_updates_selected_bits() {
         let mut data = data();
         data.holding_registers[4] = 0x0012;
-        let response = handle_request(
-            &mut data,
-            Request::MaskWriteRegister(4, 0x00F2, 0x0025),
-            false,
-            None,
-            1,
-        )
-        .unwrap()
-        .unwrap();
+        let response = handle_request(&mut data, Request::MaskWriteRegister(4, 0x00F2, 0x0025), 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(response, Response::MaskWriteRegister(4, 0x00F2, 0x0025));
         assert_eq!(data.holding_registers[4], 0x0017);
     }
@@ -646,8 +627,6 @@ mod tests {
         let response = handle_request(
             &mut data,
             Request::ReadWriteMultipleRegisters(0, 2, 0, Cow::Owned(vec![9, 8])),
-            false,
-            None,
             1,
         )
         .unwrap()
@@ -664,8 +643,6 @@ mod tests {
         let response = handle_request(
             &mut data,
             Request::Custom(0x18, Cow::Owned(vec![0x00, 0x01])),
-            false,
-            None,
             1,
         )
         .unwrap()
@@ -688,23 +665,15 @@ mod tests {
         handle_request(
             &mut data,
             Request::Custom(0x15, Cow::Owned(write.clone())),
-            false,
-            None,
             1,
         )
         .unwrap()
         .unwrap();
         assert_eq!(data.files.get(&(4, 7)), Some(&0x1234));
         let read = vec![0x07, 0x06, 0x00, 0x04, 0x00, 0x07, 0x00, 0x01];
-        let response = handle_request(
-            &mut data,
-            Request::Custom(0x14, Cow::Owned(read)),
-            false,
-            None,
-            1,
-        )
-        .unwrap()
-        .unwrap();
+        let response = handle_request(&mut data, Request::Custom(0x14, Cow::Owned(read)), 1)
+            .unwrap()
+            .unwrap();
         match response {
             Response::Custom(0x14, bytes) => {
                 assert_eq!(bytes.as_ref(), [0x04, 0x03, 0x06, 0x12, 0x34]);
@@ -717,7 +686,7 @@ mod tests {
         assert_eq!(payload[2], 0x82);
         assert!(payload.windows(6).any(|window| window == b"mb-cli"));
 
-        let response = handle_request(&mut data, Request::ReportServerId, false, None, 7)
+        let response = handle_request(&mut data, Request::ReportServerId, 7)
             .unwrap()
             .unwrap();
         match response {
@@ -737,8 +706,6 @@ mod tests {
         let echo = handle_request(
             &mut data,
             Request::Custom(0x08, Cow::Owned(vec![0x00, 0x00, 0x12, 0x34])),
-            false,
-            None,
             1,
         )
         .unwrap()
@@ -748,15 +715,31 @@ mod tests {
         let silent = handle_request(
             &mut data,
             Request::Custom(0x08, Cow::Owned(vec![0x00, 0x04, 0x00, 0x00])),
-            false,
-            None,
             1,
         )
         .unwrap();
         assert!(silent.is_none());
         assert!(data.diagnostics.listen_only);
 
-        let ignored = handle_request(&mut data, Request::ReadCoils(0, 1), false, None, 1).unwrap();
+        let ignored = handle_request(&mut data, Request::ReadCoils(0, 1), 1).unwrap();
         assert!(ignored.is_none());
+    }
+
+    #[test]
+    fn summary_includes_function_address_quantity_and_outcome() {
+        let request = Request::ReadHoldingRegisters(5, 3);
+        let ok = summarize(
+            1,
+            &request,
+            &Ok(Some(Response::ReadHoldingRegisters(vec![1, 2, 3]))),
+        );
+        assert_eq!(ok, "station=1 fc=0x03 addr=5 qty=3 result=ok");
+        let denied = summarize(4, &request, &Err(ExceptionCode::IllegalDataAddress));
+        assert_eq!(
+            denied,
+            "station=4 fc=0x03 addr=5 qty=3 result=exception 0x02"
+        );
+        let silent = summarize(0, &Request::WriteSingleRegister(2, 9), &Ok(None));
+        assert_eq!(silent, "station=0 fc=0x06 addr=2 qty=1 result=no-response");
     }
 }

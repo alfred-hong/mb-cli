@@ -1,5 +1,5 @@
 use crate::cli::{DecodeArgs, DecodeFormat, RegisterOrder};
-use crate::table::write_register_table;
+use crate::table::{write_register_table, AddressStyle};
 use std::fmt::Write as _;
 
 /// One decoded value and the PDU address of its first register.
@@ -50,11 +50,12 @@ pub fn write_words(
     start: u16,
     verbose: bool,
     options: &DecodeArgs,
+    style: AddressStyle,
 ) -> anyhow::Result<()> {
     if options.formats.is_empty() {
-        write_register_table(out, words, start, verbose);
+        write_register_table(out, words, start, verbose, style);
     }
-    write_decoded(out, words, start, options)
+    write_decoded(out, words, start, options, style)
 }
 
 /// Print the raw register table, or only the decoded tables when `--decode` is set.
@@ -63,9 +64,10 @@ pub fn print_words(
     start: u16,
     verbose: bool,
     options: &DecodeArgs,
+    style: AddressStyle,
 ) -> anyhow::Result<()> {
     let mut out = String::new();
-    write_words(&mut out, words, start, verbose, options)?;
+    write_words(&mut out, words, start, verbose, options, style)?;
     print!("{out}");
     Ok(())
 }
@@ -76,6 +78,7 @@ pub fn write_decoded(
     words: &[u16],
     start: u16,
     options: &DecodeArgs,
+    style: AddressStyle,
 ) -> anyhow::Result<()> {
     if options.formats.is_empty() {
         if options.swap_bytes || options.order == RegisterOrder::Lsrf {
@@ -104,7 +107,8 @@ pub fn write_decoded(
         let _ = writeln!(out, "{:<8} Value", "Address");
         let _ = writeln!(out, "{:-<8} {:-<12}", "", "");
         for row in &rows {
-            let _ = writeln!(out, "{:<8} {}", row.address, row.value);
+            let address = crate::table::format_address(style, row.address);
+            let _ = writeln!(out, "{address:<8} {}", row.value);
         }
         if leftover != 0 {
             let _ = writeln!(
@@ -182,8 +186,9 @@ fn format_f64(bytes: &[u8]) -> String {
     format_float(f64::from_be_bytes(array))
 }
 
-fn format_float(value: impl std::fmt::Display) -> String {
-    value.to_string()
+fn format_float(value: impl std::fmt::Debug) -> String {
+    // Display expands subnormal values into a long run of zeros. Debug keeps a short decimal.
+    format!("{value:?}")
 }
 
 fn format_bits(bytes: &[u8]) -> String {

@@ -95,12 +95,13 @@
         - [x] Timeout error handling
         - [x] Exception response handling
         - [x] Duration configuration
-- [ ] Add integration tests (future enhancement)
-    - [ ] Basic integration tests (server on port 5020):
-        - [ ] Server startup and shutdown
-        - [ ] End-to-end CLI testing
-        - [ ] Network failure scenarios
-        - [ ] CLI argument validation
+- [x] Add integration tests
+    - [x] Basic integration tests (server on a free local port):
+        - [x] Server startup and shutdown
+        - [x] End-to-end CLI testing with `mb_client` against `mb_server`
+        - [x] Network failure scenarios
+        - [x] CLI argument validation
+        - [x] Every public `mb_client` command against `mb_server`: four areas and aliases, address forms, decode formats, writes, mask, read-write, file, FIFO, diagnostics, identity, raw exceptions, and read-only writes
 - [x] Create comprehensive documentation and examples
     - [x] README with usage examples
         - [x] Installation instructions
@@ -113,7 +114,7 @@
     - [ ] Release preparation
 
 ## Future Enhancements
-- [ ] Server configuration files (holding file, etc.)
+- [ ] Server configuration files: see "mb_server simulator behavior" (snapshot and sparse map)
 - [ ] Probing functionality (removed from current scope)
 
 ## Upgrade dependencies
@@ -148,10 +149,110 @@
 - [x] README examples cover station flags, area addresses, every decode format, and live reads
 
 ## Align documentation with runtime
-- [x] Install the `mb` binary from the `mb-cli` package
+- [x] Install the `mb_client` and `mb_server` binaries from the `mb-cli` package
 - [x] Server requires `--ip` or `--device`
 - [x] Server `--unit` answers only that id
 - [x] Server `--verbose` / `-v` logs each request and the TCP client address
 - [x] Server `--timeout` covers bind, serial open, and idle TCP connections
 - [x] Startup text matches coil/discrete OFF and register address initialization
 - [x] CLI examples use the singular `coil` command
+
+## Split the client and the server
+- [x] `mb_client` contains only the client commands
+- [x] `mb_server` is the memory server, with no client subcommands
+- [x] Address parsing and serial settings stay in the shared library
+
+## mb_server simulator behavior
+
+A lab slave. These items add the behaviors common Modbus simulators expose. Named points, scripts, a web UI, and DF1 stay out. Sine animation is not included.
+
+Decisions recorded here:
+
+- The snapshot is one CSV. Each data row is `area,address,value`, the layout ModRSsim2 uses for type, number, and value on one line. `area` is `coil`, `holding`, or `input`. `address` uses the client address parser. A register value is a decimal integer 0–65535. A coil value is `0` or `1`. The header row is required. A duplicated address keeps the last row.
+- The CSV covers coils, holding registers, and input registers. Discrete inputs stay OFF and are not in the file.
+- Startup values for those three areas are a new random draw each process start: registers are integers 0–65535, coils are 0 or 1. Integers are rational, and a register cannot store a fraction. A CSV row replaces the random value at that address. On exit the file is rewritten with every address in the three configured areas, so the next start restores this image instead of drawing again.
+- No per-second increment, coil toggle, or new random draw after startup. A client write to a coil or holding register replaces that value, and the value then stays. Input registers never change after startup.
+- Fault delay commits a normal write, then waits, then responds. Silence on a write does not change data and sends nothing. A forced exception targets one function code chosen at startup and uses 02, 03, or 04. That function code does not write. A later request with a function code that is not forced writes as usual.
+- Every configured station reads and writes the same memory image. Station ids come from repeated `--modbus_address` (or `--addr`) and are fixed at startup. Omitting the flag serves station 1. An id that is not in the list gets no response. There is no runtime switch to turn a station off, and exception 10 is not used for that.
+- With no `--device`, the server listens on TCP `0.0.0.0` port 502. This replaces the old rule that `--ip` or `--device` is required. `--ip` still selects another address. `--ip` together with `--device` is still an error.
+- While the process is running, listen address, station list, snapshot file, and fault settings stay as they were at startup. A client may still write coils and holding registers. Input registers and discrete inputs stay read-only.
+- ASCII, UDP, RS-485 RTS-per-response, and RTU inter-frame gap tolerance are deferred. tokio-modbus 0.17.0 and tokio-serial 5.5.0 do not provide them. Do not implement them in this round.
+
+### Step 1: Request log
+- [x] With `--verbose`, log the function code, station id, start address, quantity, and outcome (normal response or exception code)
+- [x] Keep the TCP peer address in that line
+
+### Step 2: Snapshot
+- [x] Load coils, holding registers, and input registers from `--csv <FILE>` before serving
+- [x] Let a CSV row override the startup random value at that address
+- [x] On exit, rewrite the CSV with every address in the three configured areas
+- [x] Do not reload the CSV while the server is running
+- [x] Reject a row whose address is outside the configured `--num-*` size, or whose area is `discrete`
+
+### Step 3: Startup values
+- [x] At startup, draw a new random integer 0–65535 for every holding and input register, and 0 or 1 for every coil
+- [x] Leave discrete inputs OFF
+- [x] After startup, leave input registers unchanged
+- [x] After a client write to a coil or holding register, leave that value unchanged until another client write
+
+### Step 4: Delay and forced faults
+- [x] Optional fixed response delay, in milliseconds, after a normal write is stored and before the response is sent
+- [x] Optional forced exception 02, 03, or 04 for one function code chosen at startup
+- [x] Do not modify memory for that forced function code
+- [x] Apply a later request when its function code is not the forced one
+- [x] Optional silence on write requests: the write is not applied and no response is sent
+
+### Step 5: Broadcast station 0
+- [x] A write to station 0 updates the shared memory and produces no response
+- [x] A read to station 0 produces no response
+- [x] Station 0 cannot be selected as a normal station id
+
+### Step 6: Listen address
+- [x] Omit `--ip` and `--device` to bind TCP `0.0.0.0:502`
+- [x] Document the default in the README, including the old "requires `--ip` or `--device`" examples
+
+### Step 7: Several stations
+- [x] Accept one station with `--modbus_address 1`, or several with repeated `--modbus_address`
+- [x] Fix that list at startup
+- [x] All of those stations share one coil, discrete, input, and holding image
+- [x] Send no response for a station id that is not in the list
+
+### Step 8: More transports
+- [x] RTU over TCP, using tokio-modbus `server::rtu_over_tcp` (enable feature `rtu-over-tcp-server`)
+
+### Step 9: Address window
+- [x] Keep one contiguous window per area, sized by `--num-*` and starting at 0
+- [x] Return exception 02 for an address outside that window
+- [x] Use the CSV for values inside the window, not as a list of holes
+
+### Deferred until a library can do them
+Do not implement these in this round.
+
+- [ ] Modbus ASCII
+- [ ] Modbus UDP
+- [ ] RS-485 RTS around each RTU response
+- [ ] Configurable RTU inter-frame gap tolerance
+- [ ] Functions 08, 20, and 21 on serial RTU and on RTU over TCP. `get_request_pdu_len` rejects 0x08, 0x14, and 0x15. RTU over TCP uses that same codec.
+
+### Notes
+Library check against tokio-modbus 0.17.0 and tokio-serial 5.5.0. The service future is awaited before a TCP or RTU response is sent, and `Ok(None)` skips the response. `ExceptionCode` includes 02, 03, and 04.
+
+The earlier open points are closed. Per-second increment and coil toggle are not part of this server: they would change a writable value after it had been written. Unlisted CSV addresses are served inside the `--num-*` window with a startup random value; they are not holes that return exception 02.
+
+A later check of rs-modbus 2.0, rmodbus 0.12, rodbus 1.5, and rusty-modbus-codec found no drop-in replacement. rs-modbus has ASCII and UDP, but not functions 07, 08, 11, 12, 20, 21, or 24. rmodbus frames ASCII and UDP only for functions 01–06, 15, and 16, and its length guess treats every other code as a fixed-size PDU. tokio-modbus 0.17.0 remains the newest release and still keeps `get_request_pdu_len` private. Do not switch stacks to gain ASCII or UDP.
+
+## mb_client as a command-line ModScan
+
+`mb_client` covers ModScan's master functions through flags. Windows UI, colors, fonts, charts, modem dialing, OLE, and database capture stay out.
+
+- [x] Scan interval in milliseconds (`--interval`, default 1000, `0` means no extra wait)
+- [x] A failed sample during `--timeout` stays on screen and the scan continues
+- [x] Request and valid-reply counters on a repeating scan
+- [x] One log line per sample (`--log`)
+- [x] Connection and response wait separate from the scan window (`--response-timeout`, default 5 seconds)
+- [x] `--verbose` prints transmitted and received bytes
+- [x] `--notation modicon` prints 00001 / 10001 / 30001 / 40001, and six digits past offset 9999
+- [x] One raw function code, ModScan's user command (`mb_client raw`)
+- [ ] ModScan test script: name, station, function, address, length, data, and an expected result of data, exception 01/02/04, or no response. Deliberately bad CRC stays out
+- [ ] ASCII, UDP, and RS-485 RTS timing stay deferred with the server. The current library does not provide them
+

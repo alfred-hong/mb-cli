@@ -4,7 +4,7 @@ version = "1.2.2"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Warren Krettek <warrenkrettek@gmail.com>"]
-description = "A blazing fast, reliable Modbus TCP and RTU client and server command-line tool"
+description = "Modbus TCP and RTU client (mb_client) and memory server (mb_server)"
 readme = "README.md"
 homepage = "https://github.com/wkrettek/mb-cli"
 repository = "https://github.com/wkrettek/mb-cli"
@@ -16,15 +16,23 @@ exclude = [
     "AGENTS.md"
 ]
 
+[lib]
+name = "mb_cli"
+path = "src/lib.rs"
+
 [[bin]]
-name = "mb"
-path = "src/main.rs"
+name = "mb_client"
+path = "src/bin/mb_client/main.rs"
+
+[[bin]]
+name = "mb_server"
+path = "src/bin/mb_server/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["full"] }
-tokio-modbus = { version = "0.17.0", features = ["tcp-server", "rtu-server"] }
+tokio-modbus = { version = "0.17.0", features = ["tcp-server", "rtu-server", "rtu-over-tcp-server"] }
 tokio-serial = "5.5.0"
 
 [dev-dependencies]
