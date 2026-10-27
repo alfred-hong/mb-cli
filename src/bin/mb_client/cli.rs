@@ -4,31 +4,61 @@ use std::{net::IpAddr, path::PathBuf};
 
 // Custom validation functions for Modbus specification limits
 fn validate_coil_qty(s: &str) -> Result<u16, String> {
-    let qty: u16 = s
-        .parse()
-        .map_err(|_| format!("Invalid quantity '{s}': must be a number"))?;
+    parse_quantity(s, 1, 2000, "FC 01/02")
+}
 
-    if !(1..=2000).contains(&qty) {
+fn validate_register_qty(s: &str) -> Result<u16, String> {
+    parse_quantity(s, 1, 125, "FC 03/04/23")
+}
+
+/// Decimal quantity inside an inclusive Modbus limit.
+fn parse_quantity(text: &str, min: u16, max: u16, function: &str) -> Result<u16, String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "quantity '{text}' must be a decimal number in {min}-{max} ({function})"
+        ));
+    }
+    let qty: u16 = text.parse().map_err(|_| {
+        format!("quantity '{text}' must be a decimal number in {min}-{max} ({function})")
+    })?;
+    if !(min..=max).contains(&qty) {
         Err(format!(
-            "Invalid quantity {qty}: Modbus specification limits coil and discrete reads to 1-2000 per request (FC 01/02)"
+            "quantity {qty} is outside {min}-{max} ({function})"
         ))
     } else {
         Ok(qty)
     }
 }
 
-fn validate_register_qty(s: &str) -> Result<u16, String> {
-    let qty: u16 = s
-        .parse()
-        .map_err(|_| format!("Invalid quantity '{s}': must be a number"))?;
-
-    if !(1..=125).contains(&qty) {
-        Err(format!(
-            "Invalid quantity {qty}: Modbus specification limits register operations to 1-125 registers per request (FC 03/04/06/16)"
-        ))
-    } else {
-        Ok(qty)
+/// Milliseconds between scan samples. `0` means no extra wait.
+fn validate_interval(text: &str) -> Result<u64, String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "interval '{text}' must be a decimal number of milliseconds"
+        ));
     }
+    text.parse()
+        .map_err(|_| format!("interval '{text}' must be a decimal number of milliseconds"))
+}
+
+/// Client station id. `0` is the broadcast address.
+fn parse_station(text: &str) -> Result<u8, String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "station address '{text}' must be a decimal number 0-255"
+        ));
+    }
+    text.parse::<u8>()
+        .map_err(|_| format!("station address '{text}' must be 0-255"))
+}
+
+/// Device-identification object id.
+fn parse_object_id(text: &str) -> Result<u8, String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("object id '{text}' must be a decimal number 0-255"));
+    }
+    text.parse::<u8>()
+        .map_err(|_| format!("object id '{text}' must be 0-255"))
 }
 
 fn parse_function_code(text: &str) -> Result<u8, String> {
@@ -103,6 +133,8 @@ pub struct Common {
         visible_alias = "addr",
         value_name = "ADDRESS",
         default_value_t = 0,
+        value_parser = parse_station,
+        allow_hyphen_values = true,
         display_order = 8
     )]
     pub unit: u8,
@@ -249,6 +281,8 @@ pub struct ReadTiming {
         long = "interval",
         default_value_t = 1000,
         value_name = "MILLISECONDS",
+        value_parser = validate_interval,
+        allow_hyphen_values = true,
         display_order = 13
     )]
     pub interval_ms: u64,
@@ -302,10 +336,10 @@ pub enum Command {
     /// Diagnostics (FC 08). Defined for serial lines; this server also answers it on TCP.
     Diagnostics {
         /// Sub-function name or number. See `mb_client diagnostics --help`.
-        #[arg(long, value_parser = mb_cli::address::parse_diagnostic_sub)]
+        #[arg(long, value_parser = mb_cli::address::parse_diagnostic_sub, allow_hyphen_values = true)]
         sub: u16,
         /// Data word, decimal or 0x hex. Restart uses 0xFF00 to clear counters.
-        #[arg(long, default_value = "0", value_parser = mb_cli::address::parse_word)]
+        #[arg(long, default_value = "0", value_parser = mb_cli::address::parse_word, allow_hyphen_values = true)]
         data: u16,
         #[command(flatten)]
         common: Common,
@@ -314,7 +348,7 @@ pub enum Command {
     /// Send one function code and print the response. ModScan calls this a user command.
     Raw {
         /// Function code, 1-127.
-        #[arg(long, value_parser = parse_function_code)]
+        #[arg(long, value_parser = parse_function_code, allow_hyphen_values = true)]
         function: u8,
         /// Bytes after the function code. Hex bytes separated by commas or spaces, such as `00,00,00,01`.
         #[arg(long, default_value = "")]
@@ -326,13 +360,13 @@ pub enum Command {
     /// Write holding registers, then read holding registers (FC 23)
     ReadWrite {
         /// Register to read: decimal PDU, 0x hex, or a 4XXXX holding reference
-        #[arg(long = "read-unit", value_parser = mb_cli::address::parse_holding_address)]
+        #[arg(long = "read-unit", value_parser = mb_cli::address::parse_holding_address, allow_hyphen_values = true)]
         read_addr: u16,
         /// Read quantity (1-125)
-        #[arg(long = "read-qty", default_value_t = 1, value_parser = validate_register_qty)]
+        #[arg(long = "read-qty", default_value_t = 1, value_parser = validate_register_qty, allow_hyphen_values = true)]
         read_qty: u16,
         /// Register to write: decimal PDU, 0x hex, or a 4XXXX holding reference
-        #[arg(long = "unit", value_parser = mb_cli::address::parse_holding_address)]
+        #[arg(long = "unit", value_parser = mb_cli::address::parse_holding_address, allow_hyphen_values = true)]
         start: u16,
         /// Values to write before the read (1-121 words, decimal or 0x hex)
         #[arg(
@@ -356,10 +390,10 @@ pub enum ReadArea {
     #[command(visible_alias = "discrete-output", visible_alias = "0xxxx")]
     Coil {
         /// PDU address (decimal or 0x hex) or a 0XXXX reference. 00001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_coil_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_coil_address, allow_hyphen_values = true)]
         start: u16,
         /// Quantity (default 1, max 2000)
-        #[arg(long = "qty", default_value_t = 1, value_parser = validate_coil_qty, display_order = 6)]
+        #[arg(long = "qty", default_value_t = 1, value_parser = validate_coil_qty, allow_hyphen_values = true, display_order = 6)]
         qty: u16,
         #[command(flatten)]
         common: Common,
@@ -370,10 +404,10 @@ pub enum ReadArea {
     #[command(visible_alias = "discrete-input", visible_alias = "1xxxx")]
     Discrete {
         /// PDU address (decimal or 0x hex) or a 1XXXX reference. 10001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_discrete_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_discrete_address, allow_hyphen_values = true)]
         start: u16,
         /// Quantity (default 1, max 2000)
-        #[arg(long = "qty", default_value_t = 1, value_parser = validate_coil_qty, display_order = 6)]
+        #[arg(long = "qty", default_value_t = 1, value_parser = validate_coil_qty, allow_hyphen_values = true, display_order = 6)]
         qty: u16,
         #[command(flatten)]
         common: Common,
@@ -384,10 +418,10 @@ pub enum ReadArea {
     #[command(visible_alias = "holding-register", visible_alias = "4xxxx")]
     Holding {
         /// PDU address (decimal or 0x hex) or a 4XXXX reference. 40001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address, allow_hyphen_values = true)]
         start: u16,
         /// Quantity (default 1, max 125)
-        #[arg(long = "qty", default_value_t = 1, value_parser = validate_register_qty, display_order = 6)]
+        #[arg(long = "qty", default_value_t = 1, value_parser = validate_register_qty, allow_hyphen_values = true, display_order = 6)]
         qty: u16,
         #[command(flatten)]
         decode: DecodeArgs,
@@ -400,10 +434,10 @@ pub enum ReadArea {
     #[command(visible_alias = "input-register", visible_alias = "3xxxx")]
     Input {
         /// PDU address (decimal or 0x hex) or a 3XXXX reference. 30001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_input_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_input_address, allow_hyphen_values = true)]
         start: u16,
         /// Quantity (default 1, max 125)
-        #[arg(long = "qty", default_value_t = 1, value_parser = validate_register_qty, display_order = 6)]
+        #[arg(long = "qty", default_value_t = 1, value_parser = validate_register_qty, allow_hyphen_values = true, display_order = 6)]
         qty: u16,
         #[command(flatten)]
         decode: DecodeArgs,
@@ -443,7 +477,7 @@ pub enum ReadArea {
     /// Read a FIFO queue (FC 24). The holding register at `--unit` holds the count.
     Fifo {
         /// FIFO pointer: decimal PDU, 0x hex, or a 4XXXX holding reference
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address, allow_hyphen_values = true)]
         start: u16,
         #[command(flatten)]
         decode: DecodeArgs,
@@ -476,7 +510,7 @@ pub enum ReadArea {
         #[arg(long, value_enum, default_value_t = DeviceIdCode::Basic)]
         code: DeviceIdCode,
         /// Object id for `--code specific`, or the first object of a stream
-        #[arg(long, default_value_t = 0)]
+        #[arg(long = "object", default_value_t = 0, value_parser = parse_object_id, allow_hyphen_values = true)]
         object: u8,
         #[command(flatten)]
         common: Common,
@@ -491,7 +525,7 @@ pub enum WriteArea {
     #[command(visible_alias = "discrete-output", visible_alias = "0xxxx")]
     Coil {
         /// PDU address (decimal or 0x hex) or a 0XXXX reference. 00001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_coil_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_coil_address, allow_hyphen_values = true)]
         start: u16,
         /// Value(s): 0=OFF, non-zero=ON. Decimal or 0x hex, comma-separated.
         #[arg(
@@ -509,7 +543,7 @@ pub enum WriteArea {
     #[command(visible_alias = "holding-register", visible_alias = "4xxxx")]
     Holding {
         /// PDU address (decimal or 0x hex) or a 4XXXX reference. 40001 is PDU 0.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address, allow_hyphen_values = true)]
         start: u16,
         /// Value(s), decimal or 0x hex, comma-separated. At most 123 words.
         #[arg(
@@ -526,13 +560,13 @@ pub enum WriteArea {
     /// Mask-write one holding register (FC 22): `(current AND and) OR (or AND NOT and)`
     Mask {
         /// PDU address (decimal or 0x hex) or a 4XXXX reference
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_holding_address, allow_hyphen_values = true)]
         start: u16,
         /// AND mask, decimal or 0x hex
-        #[arg(long = "and", value_parser = mb_cli::address::parse_word)]
+        #[arg(long = "and", value_parser = mb_cli::address::parse_word, allow_hyphen_values = true)]
         and_mask: u16,
         /// OR mask, decimal or 0x hex
-        #[arg(long = "or", value_parser = mb_cli::address::parse_word)]
+        #[arg(long = "or", value_parser = mb_cli::address::parse_word, allow_hyphen_values = true)]
         or_mask: u16,
         #[command(flatten)]
         common: Common,
@@ -555,7 +589,7 @@ pub enum WriteArea {
     #[command(visible_alias = "discrete-input", visible_alias = "1xxxx")]
     Discrete {
         /// PDU address or a 1XXXX reference. The write is rejected either way.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_discrete_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_discrete_address, allow_hyphen_values = true)]
         start: Option<u16>,
         /// Values are not written. Discrete inputs stay read-only.
         #[arg(long = "value")]
@@ -567,7 +601,7 @@ pub enum WriteArea {
     #[command(visible_alias = "input-register", visible_alias = "3xxxx")]
     Input {
         /// PDU address or a 3XXXX reference. The write is rejected either way.
-        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_input_address)]
+        #[arg(long = "unit", value_name = "UNIT", value_parser = mb_cli::address::parse_input_address, allow_hyphen_values = true)]
         start: Option<u16>,
         /// Values are not written. Input registers stay read-only.
         #[arg(long = "value")]
@@ -606,7 +640,8 @@ mod tests {
 
         let result = validate_coil_qty("abc");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must be a number"));
+        assert!(result.unwrap_err().contains("decimal number"));
+        assert!(validate_coil_qty("-1").unwrap_err().contains("1-2000"));
     }
 
     #[test]
@@ -630,11 +665,11 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err();
         assert!(error_msg.contains("1-125"));
-        assert!(error_msg.contains("FC 03/04/06/16"));
+        assert!(error_msg.contains("FC 03/04/23"));
 
         let result = validate_register_qty("xyz");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must be a number"));
+        assert!(result.unwrap_err().contains("decimal number"));
     }
 
     #[test]

@@ -166,6 +166,7 @@ pub async fn read_fifo(
     decode_options: &DecodeArgs,
     timing: &ReadTiming,
 ) -> anyhow::Result<()> {
+    decode::ensure_decode_flags(decode_options)?;
     let mut client = connect_to_modbus(common).await?;
     each_read(timing, async || {
         let response = call_custom(
@@ -208,6 +209,7 @@ pub async fn read_file(
     decode_options: &DecodeArgs,
     timing: &ReadTiming,
 ) -> anyhow::Result<()> {
+    decode::ensure_decode_flags(decode_options)?;
     let payload = encode_file_read(groups)?;
     let mut client = connect_to_modbus(common).await?;
     each_read(timing, async || {
@@ -267,6 +269,7 @@ pub async fn read_device_id(
 }
 
 pub async fn diagnostics(common: &Common, sub: u16, data: u16) -> anyhow::Result<()> {
+    let mut client = connect_to_modbus(common).await?;
     if sub == 0x0004 {
         println!(
             "Listen-only mode sends no response. A timeout means the server entered that mode."
@@ -275,7 +278,14 @@ pub async fn diagnostics(common: &Common, sub: u16, data: u16) -> anyhow::Result
     let mut payload = Vec::with_capacity(4);
     payload.extend(sub.to_be_bytes());
     payload.extend(data.to_be_bytes());
-    let response = custom(common, 0x08, &payload, "diagnostics").await?;
+    let response = call_custom(
+        &mut client,
+        0x08,
+        &payload,
+        "diagnostics",
+        common.response_timeout,
+    )
+    .await?;
     let Response::Custom(_, bytes) = response else {
         anyhow::bail!("unexpected diagnostics response");
     };
@@ -347,6 +357,7 @@ pub async fn read_write(
     values: &[u16],
     decode_options: &DecodeArgs,
 ) -> anyhow::Result<()> {
+    decode::ensure_decode_flags(decode_options)?;
     ensure_read_write_count(values.len())?;
     let mut client = connect_to_modbus(common).await?;
     let registers = modbus_operation_with_timeout(

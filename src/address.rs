@@ -114,7 +114,18 @@ pub fn parse_diagnostic_sub(text: &str) -> Result<u16, String> {
         "server-busy" => Ok(0x0011),
         "bus-overrun" => Ok(0x0012),
         "clear-overrun" => Ok(0x0014),
-        _ => parse_word(text),
+        _ => parse_word(text).map_err(|err| {
+            let numeric = text.starts_with("0x")
+                || text.starts_with("0X")
+                || text.bytes().all(|byte| byte.is_ascii_digit());
+            if numeric {
+                err
+            } else {
+                format!(
+                    "unknown diagnostics sub-function '{text}': use a name such as return-query or listen-only, or a decimal or 0x number"
+                )
+            }
+        }),
     }
 }
 
@@ -125,9 +136,12 @@ pub fn parse_file_read_group(text: &str) -> Result<FileReadGroup, String> {
     if length == 0 {
         return Err("file record length must be at least 1".to_string());
     }
+    let file = parse_word(file)?;
+    let record = parse_word(record)?;
+    check_file_span(file, record, u32::from(length))?;
     Ok(FileReadGroup {
-        file: parse_word(file)?,
-        record: parse_word(record)?,
+        file,
+        record,
         length,
     })
 }
@@ -142,11 +156,32 @@ pub fn parse_file_write_group(text: &str) -> Result<FileWriteGroup, String> {
         .split(',')
         .map(parse_word)
         .collect::<Result<Vec<_>, _>>()?;
+    let file = parse_word(file)?;
+    let record = parse_word(record)?;
+    let count = u32::try_from(values.len()).unwrap_or(u32::MAX);
+    check_file_span(file, record, count)?;
     Ok(FileWriteGroup {
-        file: parse_word(file)?,
-        record: parse_word(record)?,
+        file,
+        record,
         values,
     })
+}
+
+/// File numbers are 1-based. Records run from 0 through 0x270F, including the span of `count`.
+fn check_file_span(file: u16, record: u16, count: u32) -> Result<(), String> {
+    const MAX_FILE_RECORD: u16 = 0x270F;
+    if file == 0 {
+        return Err("file number must be 1-65535".to_string());
+    }
+    if record > MAX_FILE_RECORD {
+        return Err(format!("file record {record} is outside 0-9999 (0x270F)"));
+    }
+    if u32::from(record) + count > u32::from(MAX_FILE_RECORD) + 1 {
+        return Err(format!(
+            "file record {record} length {count} goes past record 9999 (0x270F)"
+        ));
+    }
+    Ok(())
 }
 
 fn split_group(text: &str) -> Result<[&str; 3], String> {
@@ -172,24 +207,41 @@ fn parse_area_reference(text: &str, expected: Area) -> Result<Option<u16>, Strin
     let offset: u32 = text[1..]
         .parse()
         .map_err(|_| format!("invalid address '{text}'"))?;
-    let max = if text.len() == 5 { 9999 } else { 65536 };
-    if offset == 0 || offset > max {
+    // An offset of 0, such as 40000, is a decimal PDU address rather than a reference.
+    if offset == 0 {
         return Ok(None);
     }
     if reference_area != expected {
         return Err(format!(
-            "address {text} is a {} reference; this command uses {}",
+            "address {text} is {} {} reference; this command uses {} {}",
+            article(reference_area.name()),
             reference_area.name(),
+            article(expected.name()),
             expected.name()
+        ));
+    }
+    let max = if text.len() == 5 { 9999 } else { 65536 };
+    if offset > max {
+        return Err(format!(
+            "address {text} is outside the {} reference range; a {}-digit offset is 1-{max}",
+            expected.name(),
+            text.len()
         ));
     }
     Ok(Some((offset - 1) as u16))
 }
 
+fn article(name: &str) -> &'static str {
+    match name.as_bytes().first() {
+        Some(b'a' | b'e' | b'i' | b'o' | b'u') => "an",
+        _ => "a",
+    }
+}
+
 fn parse_decimal_u16(text: &str) -> Result<u16, String> {
     if !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!(
-            "invalid number '{text}': use a decimal value or a 0x hexadecimal value"
+            "invalid number '{text}': use a decimal value 0-65535 or a 0x hexadecimal value"
         ));
     }
     text.parse::<u16>()
@@ -198,9 +250,9 @@ fn parse_decimal_u16(text: &str) -> Result<u16, String> {
 
 fn parse_hex_u16(hex: &str, original: &str) -> Result<u16, String> {
     if hex.is_empty() || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("invalid hexadecimal address '{original}'"));
+        return Err(format!("invalid hexadecimal value '{original}'"));
     }
-    u16::from_str_radix(hex, 16).map_err(|_| format!("invalid hexadecimal address '{original}'"))
+    u16::from_str_radix(hex, 16).map_err(|_| format!("invalid hexadecimal value '{original}'"))
 }
 
 #[cfg(test)]
@@ -250,5 +302,19 @@ mod tests {
         assert_eq!(write.values, vec![0x1234, 2]);
         assert_eq!(parse_diagnostic_sub("listen-only").unwrap(), 4);
         assert_eq!(parse_diagnostic_sub("0x0A").unwrap(), 10);
+        let unknown = parse_diagnostic_sub("nope").unwrap_err();
+        assert!(unknown.contains("sub-function"));
+        let file = parse_file_read_group("0:0:1").unwrap_err();
+        assert!(file.contains("1-65535"));
+        let record = parse_file_read_group("1:10000:1").unwrap_err();
+        assert!(record.contains("0x270F"));
+    }
+
+    #[test]
+    fn a_six_digit_reference_past_the_table_names_the_range() {
+        let error = parse_address("465537", Area::Holding).unwrap_err();
+        assert!(error.contains("1-65536"), "{error}");
+        let grammar = parse_address("30001", Area::Holding).unwrap_err();
+        assert!(grammar.contains("an input register"), "{grammar}");
     }
 }

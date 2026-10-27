@@ -11,13 +11,26 @@ mod trace;
 use actions::{area_style, ensure_write_coil_count, ensure_write_register_count, reject_readonly};
 use cli::{parse_hex_payload, Cli, Command, ReadArea, WriteArea};
 use client::{connect_to_modbus, each_read, modbus_operation_with_timeout};
+use decode::ensure_decode_flags;
 use table::{print_coil_table, print_register_table, write_coil_table};
 
 use clap::Parser;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let text = err.to_string();
+            eprint!("{text}");
+            if connection_flag_before_command(&text) {
+                eprintln!(
+                    "Put connection and station flags after the command, for example: mb_client read holding --ip 127.0.0.1 --addr 1 --unit 0"
+                );
+            }
+            std::process::exit(err.exit_code());
+        }
+    };
 
     match cli.cmd {
         Command::Read { area } => match area {
@@ -76,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 common,
                 timing,
             } => {
+                ensure_decode_flags(&decode)?;
                 let mut client = connect_to_modbus(&common).await?;
                 each_read(&timing, async || {
                     let registers = modbus_operation_with_timeout(
@@ -108,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
                 common,
                 timing,
             } => {
+                ensure_decode_flags(&decode)?;
                 let mut client = connect_to_modbus(&common).await?;
                 each_read(&timing, async || {
                     let registers = modbus_operation_with_timeout(
@@ -310,4 +325,28 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Clap reports a flag used before the subcommand as an unexpected argument.
+fn connection_flag_before_command(text: &str) -> bool {
+    if !text.contains("unexpected argument") {
+        return false;
+    }
+    [
+        "'--ip'",
+        "'--device'",
+        "'--port'",
+        "'--baud'",
+        "'--parity'",
+        "'--stop-bits'",
+        "'--data-bits'",
+        "'--modbus_address'",
+        "'--addr'",
+        "'--verbose'",
+        "'-v'",
+        "'--notation'",
+        "'--response-timeout'",
+    ]
+    .iter()
+    .any(|flag| text.contains(flag))
 }

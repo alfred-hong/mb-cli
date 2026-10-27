@@ -483,9 +483,10 @@ mb_client read coil --ip 127.0.0.1 --port 5020 --addr 1 --unit 0 --qty 8 --verbo
 
 The tool provides detailed error messages for common issues:
 
-- **Connection timeouts**: Clear timeout messages with duration
-- **Modbus exceptions**: Detailed exception codes (IllegalDataAddress, etc.)
-- **Validation errors**: Specification-compliant range checking with explanations
+- **Connection timeouts**: The message names the peer and how many seconds were allowed, and it is printed once
+- **Modbus exceptions**: The exception name, such as `IllegalDataAddress`, is printed once
+- **Validation errors**: A rejected quantity, address, file reference, station id, interval, or diagnostics name states the accepted range. `--swap-bytes` and `--order lsrf` without `--decode` stop before a connection is opened. A negative number is reported as an invalid value
+- **Flag order**: `--ip`, `--device`, `--addr`, and the other connection flags follow the command. Using one of them before `read` or `write` says to put it after the command
 - **Read-only areas**: Writing discrete inputs or input registers stops before a connection is opened
 - **Area mismatch**: A `0XXXX` / `1XXXX` / `3XXXX` / `4XXXX` reference is rejected when its prefix belongs to another command
 - **Connection failures**: Network and serial port error details

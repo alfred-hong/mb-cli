@@ -597,13 +597,9 @@ fn a_failed_scan_stays_up_and_counts_the_miss() {
         ],
     );
     expect_ok(&output);
-    let text = stdout(&output);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
     assert!(text.contains("valid=0"), "{text}");
-    assert!(
-        stderr(&output).contains("IllegalDataAddress"),
-        "{}",
-        stderr(&output)
-    );
+    assert!(text.contains("IllegalDataAddress"), "{text}");
 }
 
 #[test]
@@ -1237,4 +1233,95 @@ fn every_write_file_fifo_identity_and_diagnostic() {
         ],
         "1-125",
     );
+}
+
+fn usage_text(args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_mb_client"))
+        .args(args)
+        .output()
+        .expect("spawn mb_client");
+    assert!(
+        !output.status.success(),
+        "{args:?} was accepted\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
+}
+
+#[test]
+fn validation_errors_name_the_limit_before_connecting() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["read", "holding", "--qty", "0"], "1-125"),
+        (&["read", "holding", "--qty", "-1"], "1-125"),
+        (&["read", "coil", "--qty", "2001"], "1-2000"),
+        (&["read", "holding", "--unit", "30001"], "an input register"),
+        (&["read", "holding", "--unit", "465537"], "1-65536"),
+        (&["read", "holding", "--unit", "-1"], "0-65535"),
+        (
+            &["write", "holding", "--unit", "0", "--value", "0xGG"],
+            "hexadecimal value",
+        ),
+        (&["diagnostics", "--sub", "nope"], "sub-function"),
+        (&["read", "file", "--group", "0:0:1"], "1-65535"),
+        (&["read", "file", "--group", "1:10000:1"], "0x270F"),
+        (&["read", "holding", "--interval", "-1"], "milliseconds"),
+        (&["read", "holding", "--addr", "-1"], "0-255"),
+        (&["read", "holding", "--addr", "256"], "0-255"),
+        (
+            &["write", "discrete", "--unit", "0", "--value", "1"],
+            "read-only",
+        ),
+        (
+            &["write", "input", "--unit", "0", "--value", "1"],
+            "read-only",
+        ),
+        (
+            &[
+                "read",
+                "holding",
+                "--ip",
+                "127.0.0.1",
+                "--unit",
+                "0",
+                "--order",
+                "lsrf",
+                "--response-timeout",
+                "1",
+            ],
+            "--order lsrf requires --decode",
+        ),
+        (
+            &[
+                "read",
+                "holding",
+                "--ip",
+                "127.0.0.1",
+                "--unit",
+                "0",
+                "--swap-bytes",
+                "--response-timeout",
+                "1",
+            ],
+            "--swap-bytes requires --decode",
+        ),
+        (
+            &["--ip", "127.0.0.1", "read", "holding", "--unit", "0"],
+            "after the command",
+        ),
+    ];
+    for (args, needle) in cases {
+        let text = usage_text(args);
+        assert!(
+            text.contains(needle),
+            "expected {needle} in:\n{text}\nargs: {args:?}"
+        );
+        assert!(
+            !text.contains("Connection refused"),
+            "validation opened a connection for {args:?}:\n{text}"
+        );
+    }
 }

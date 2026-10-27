@@ -210,18 +210,16 @@ pub async fn connect_to_modbus(common: &Common) -> anyhow::Result<client::Contex
                         }
                         Ok(ctx)
                     }
-                    Err(e) => {
-                        eprintln!("Failed to connect to {ip}:{} - Error: {e}", common.port);
-                        Err(e.into())
-                    }
+                    Err(e) => Err(anyhow::anyhow!(
+                        "Failed to connect to {ip}:{}: {e}",
+                        common.port
+                    )),
                 },
-                Err(_) => {
-                    eprintln!(
-                        "Connection to {ip}:{} timed out after {} seconds",
-                        common.port, common.response_timeout
-                    );
-                    Err(anyhow::anyhow!("Connection timeout"))
-                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "Connection to {ip}:{} timed out after {} seconds",
+                    common.port,
+                    common.response_timeout
+                )),
             }
         }
         (None, Some(device)) => {
@@ -266,19 +264,16 @@ pub async fn connect_to_modbus(common: &Common) -> anyhow::Result<client::Contex
                         }
                         Ok(ctx)
                     }
-                    Err(e) => {
-                        eprintln!("Failed to connect to {} - Error: {e}", device.display());
-                        Err(e.into())
-                    }
+                    Err(e) => Err(anyhow::anyhow!(
+                        "Failed to connect to {}: {e}",
+                        device.display()
+                    )),
                 },
-                Err(_) => {
-                    eprintln!(
-                        "Connection to {} timed out after {} seconds",
-                        device.display(),
-                        common.response_timeout
-                    );
-                    Err(anyhow::anyhow!("Connection timeout"))
-                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "Connection to {} timed out after {} seconds",
+                    device.display(),
+                    common.response_timeout
+                )),
             }
         }
         (None, None) => Err(anyhow::anyhow!(
@@ -301,20 +296,13 @@ where
         Ok(modbus_result) => match modbus_result {
             Ok(response) => match response {
                 Ok(data) => Ok(data),
-                Err(exception) => {
-                    eprintln!("Modbus exception response: {exception:?}");
-                    Err(anyhow::anyhow!("Modbus exception: {:?}", exception))
-                }
+                Err(exception) => Err(anyhow::anyhow!("Modbus exception response: {exception:?}")),
             },
-            Err(e) => {
-                eprintln!("Failed to {operation}: {e}");
-                Err(e.into())
-            }
+            Err(e) => Err(anyhow::anyhow!("Failed to {operation}: {e}")),
         },
-        Err(_) => {
-            eprintln!("Operation '{operation}' timed out after {timeout_secs} seconds");
-            Err(anyhow::anyhow!("Operation timeout"))
-        }
+        Err(_) => Err(anyhow::anyhow!(
+            "Operation '{operation}' timed out after {timeout_secs} seconds"
+        )),
     }
 }
 
@@ -394,7 +382,7 @@ mod tests {
         assert!(timeout_result
             .unwrap_err()
             .to_string()
-            .contains("Operation timeout"));
+            .contains("timed out"));
     }
 
     #[test]

@@ -43,6 +43,21 @@ pub fn decode_rows(
     (rows, words.len() % step)
 }
 
+/// `--swap-bytes` and `--order lsrf` describe a decoded value, so they need `--decode`.
+pub fn ensure_decode_flags(options: &DecodeArgs) -> anyhow::Result<()> {
+    if !options.formats.is_empty() {
+        return Ok(());
+    }
+    match (options.swap_bytes, options.order) {
+        (true, RegisterOrder::Lsrf) => {
+            anyhow::bail!("--swap-bytes and --order lsrf require --decode");
+        }
+        (true, _) => anyhow::bail!("--swap-bytes requires --decode"),
+        (false, RegisterOrder::Lsrf) => anyhow::bail!("--order lsrf requires --decode"),
+        (false, RegisterOrder::Msrf) => Ok(()),
+    }
+}
+
 /// Append the raw register table, or only the decoded tables when `--decode` is set.
 pub fn write_words(
     out: &mut String,
@@ -80,13 +95,8 @@ pub fn write_decoded(
     options: &DecodeArgs,
     style: AddressStyle,
 ) -> anyhow::Result<()> {
-    if options.formats.is_empty() {
-        if options.swap_bytes || options.order == RegisterOrder::Lsrf {
-            anyhow::bail!("--swap-bytes and --order apply together with --decode");
-        }
-        return Ok(());
-    }
-    if words.is_empty() {
+    ensure_decode_flags(options)?;
+    if options.formats.is_empty() || words.is_empty() {
         return Ok(());
     }
     let prepared = apply_byte_swap(words, options.swap_bytes);

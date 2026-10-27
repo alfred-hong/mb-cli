@@ -72,8 +72,12 @@
         - [x] o3
         - [x] gemini
 - [ ] Add comprehensive error handling and retry logic
-    - [ ] Very good error messages for common issues
+    - [x] Very good error messages for common issues
         - [x] inputs and discretes are not writeable
+        - [x] Quantity, address, file, station, interval, and diagnostics errors name the accepted range and stop before connecting
+        - [x] Decode flags without `--decode` stop before connecting
+        - [x] Each connection, timeout, and exception message is printed once
+    - [ ] Retry logic
     - [x] Timeout configuration
 - [x] Add basic unit tests for fast execution (28 tests total)
     - [x] CLI validation tests (6 tests)
