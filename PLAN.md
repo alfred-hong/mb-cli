@@ -145,6 +145,7 @@
 - [x] Document the flag in the README
 - [x] Repeating reads redraw the sample in place
 - [x] Each sample is a returned string painted with cursor-up erase, not appended scrollback
+- [x] README examples cover station flags, area addresses, every decode format, and live reads
 
 ## Align documentation with runtime
 - [x] Install the `mb` binary from the `mb-cli` package

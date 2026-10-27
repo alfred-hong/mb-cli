@@ -13,6 +13,7 @@ The definitive hub for all standard specifications is the Modbus Organization, a
 - **Server mode**: Run a Modbus TCP or RTU memory server that answers those functions
 - **Addresses**: Decimal PDU addresses, `0x` hexadecimal PDU addresses, and classic `0XXXX` / `1XXXX` / `3XXXX` / `4XXXX` references
 - **Decoding**: `--decode` replaces the raw register table. Formats are binary, hexadecimal, ANSI, 16/32/64-bit integers, and IEEE 754 `f32`/`f64`, with byte swap and MSRF/LSRF register order
+- **Live read**: `--timeout` repeats a read and redraws that sample in place. A positive number is the length in seconds. `0` or a negative number continues until interrupted
 - **Table output**: One address/value table. Without `--decode` the values are decimal words. With `--decode` the values are that interpretation
 
 ## Installation
@@ -45,26 +46,39 @@ cargo install --path .
 
 #### Read Operations
 
-`--unit` is the register or coil address. `--modbus_address` and `--addr` are the station address. A client uses station 0 when that flag is omitted.
+`--unit` is the register or coil address. `--modbus_address` and `--addr` are the same station-address flag. A client uses station 0 when that flag is omitted. `--qty` is how many consecutive items to read from `--unit`. The default is 1.
 
 ```bash
-# Read holding registers from TCP server
+# Read holding registers from TCP server. Station defaults to 0.
 mb read holding --ip 192.168.1.100 --unit 0 --qty 10
 
-# Read coils from RTU device
-mb read coil --device /dev/ttyUSB0 --unit 0 --qty 8 --baud 9600
+# Same read, naming the station with either flag
+mb read holding --ip 192.168.1.100 --modbus_address 1 --unit 0 --qty 10
+mb read holding --ip 192.168.1.100 --addr 1 --unit 0 --qty 10
+
+# Read the other three areas
+mb read coil --ip 192.168.1.100 --addr 1 --unit 00001 --qty 8
+mb read discrete --ip 192.168.1.100 --addr 1 --unit 10001 --qty 8
+mb read input --ip 192.168.1.100 --addr 1 --unit 30001 --qty 4
+
+# Read coils from an RTU device
+mb read coil --device /dev/ttyUSB0 --addr 1 --unit 0 --qty 8 --baud 9600
 
 # Read with verbose output. The extra column is hexadecimal.
-mb read holding --ip 127.0.0.1 --unit 100 --qty 5 --verbose
+mb read holding --ip 127.0.0.1 --addr 1 --unit 100 --qty 5 --verbose
 
 # With --decode, the table is the interpretation.
 mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 2 --decode i32
 
 # Keep reading for 10 seconds. Each sample redraws in place, then the command exits.
-mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 4 --timeout 10
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 20 --timeout 10
 
-# Keep reading until interrupted
+# Decode while the table redraws in place
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 4 --timeout 10 --decode bin
+
+# Keep reading until interrupted. 0 and a negative value do the same thing.
 mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --timeout 0
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --timeout -1
 ```
 
 #### Write Operations
@@ -86,21 +100,27 @@ mb write holding --ip 192.168.1.100 --unit 100 --value 42,43,44
 #### Server Mode
 
 ```bash
-# Start TCP server
+# Start TCP server. Station defaults to 1.
 mb server --ip 0.0.0.0 --port 502
 
-# Start RTU server
-mb server --device /dev/ttyUSB0 --baud 9600
+# Answer only station 7. --addr is the same flag.
+mb server --ip 0.0.0.0 --port 502 --modbus_address 7
 
-# Server with custom memory layout
-mb server --ip 0.0.0.0 --num-coils 1000 --num-holding 500
+# Idle TCP connections close after 12 seconds
+mb server --ip 127.0.0.1 --port 5020 --timeout 12 --verbose
+
+# Start RTU server
+mb server --device /dev/ttyUSB0 --baud 9600 --parity even --stop-bits 1 --data-bits 8 --addr 1
+
+# Server with a custom memory layout
+mb server --ip 0.0.0.0 --num-coils 1000 --num-discrete 1000 --num-holding 500 --num-input 500
 ```
 
 ### Command Reference
 
 #### Global Options
 
-- `--timeout <SECONDS>` on a **read** command is how long to keep reading. Omit it and the command reads once. `10` repeats the read for 10 seconds, then exits. `0` or a negative value repeats until you interrupt it. On a terminal each sample replaces the previous one in the same place, one second apart. Connecting, and each individual request, still stops after 5 seconds when the peer stays silent.
+- `--timeout <SECONDS>` on a **read** command is how long to keep reading. Omit it and the command reads once. `10` repeats the read for 10 seconds, then exits. `0` or a negative value repeats until you interrupt it. On a terminal each sample replaces the previous one in the same place, one second apart. Output sent to a pipe or a file keeps every sample. Connecting, and each individual request, still stops after 5 seconds when the peer stays silent.
 - Server `--timeout <seconds>` is separate (default: 5). It covers binding the TCP port, opening the serial port, and idle TCP connections.
 - `--verbose` / `-v` - Enable verbose output. On the server this prints each request and, for TCP, the client address.
 - `--modbus_address <id>` - Modbus station address (default: 0 for the client, 1 for the server). `--addr` is the same flag. The server answers only this id and stays silent for any other id.
@@ -139,12 +159,21 @@ PDU addresses are 0-based. A classic reference is 1-based inside its area, so re
 - Hexadecimal PDU address: `0x64`, `0X00FF`.
 - Area reference. Five digits use an offset of 1-9999 (`00001`, `10001`, `30001`, `40001`, `40100`). Six digits use an offset of 1-65536 (`400001`, `465536`). The PDU address is the offset minus 1. A reference whose prefix belongs to another area is rejected. An offset of 0, such as `40000`, is not a reference and stays a decimal PDU address.
 
+Holding PDU 0 can be written `0`, `0x0`, `0x00`, `40001`, or `400001`. Holding PDU 1 can be written `1`, `0x1`, `0x01`, `40002`, or `400002`. `0x1` and `0x01` are the same hexadecimal PDU address. A classic reference uses its own area prefix: `00001` is coil PDU 0, `10001` is discrete PDU 0, and `30001` is input PDU 0.
+
 `--value`, `--and`, `--or`, and `--data` accept decimal or `0x` hexadecimal words. Quantities stay decimal.
 
 ```bash
+mb read holding --ip 127.0.0.1 --addr 1 --unit 40001
+mb read holding --ip 127.0.0.1 --addr 1 --unit 400001
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0x01
 mb read holding --ip 127.0.0.1 --addr 1 --unit 40100
+mb read coil --ip 127.0.0.1 --addr 1 --unit 00001
 mb read coil --ip 127.0.0.1 --addr 1 --unit 0x10 --qty 8
-mb read holding-register --ip 127.0.0.1 --addr 1 --unit 40001
+mb read 0xxxx --ip 127.0.0.1 --addr 1 --unit 0 --qty 8
+mb read discrete-input --ip 127.0.0.1 --addr 1 --unit 10001
+mb read input-register --ip 127.0.0.1 --addr 1 --unit 30001
+mb read holding-register --ip 127.0.0.1 --addr 1 --unit 40002
 mb write holding --ip 127.0.0.1 --addr 1 --unit 100 --value 0x2A
 ```
 
@@ -175,9 +204,14 @@ These flags are accepted by `mb read holding`, `mb read input`, `mb read fifo`, 
 
 ```bash
 mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 4 --decode bin
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 1 --decode hex
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 1 --decode u16
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 1 --decode i16
 mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 4 --decode i32 --decode f32
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 4 --decode u64 --decode i64 --decode f64
 mb read input --ip 127.0.0.1 --addr 1 --unit 0 --qty 2 --decode u32 --order lsrf --swap-bytes
 mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 2 --decode ansi --swap-bytes
+mb read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 4 --timeout 10 --decode bin
 mb read fifo --ip 127.0.0.1 --addr 1 --unit 1 --decode i16
 mb read file --ip 127.0.0.1 --addr 1 --group 4:7:2 --decode u32
 mb read-write --ip 127.0.0.1 --addr 1 --read-unit 0 --read-qty 2 --unit 0 --value 9,8 --decode i32
@@ -189,8 +223,7 @@ mb read-write --ip 127.0.0.1 --addr 1 --read-unit 0 --read-qty 2 --unit 0 --valu
 mb read <area> --unit <register> [--modbus_address <station>] [--qty <quantity>] [--timeout <SECONDS>] [--decode <format>...] [--order msrf|lsrf] [--swap-bytes] [connection options]
 ```
 
-- Coils and discrete inputs (FC 01/02): 1-2000 per request
-- Holding and input registers (FC 03/04): 1-125 per request
+- `--qty` defaults to 1. Coils and discrete inputs (FC 01/02) accept 1-2000. Holding and input registers (FC 03/04) accept 1-125.
 - `--decode`, `--order`, and `--swap-bytes` apply to `holding` and `input`. Coil and discrete reads do not take them. FIFO, file, and `read-write` accept the same three flags. A decoded read prints the interpretation in place of the raw register table.
 - `--timeout` repeats that read and redraws the sample in place. It is not accepted by writes. `mb read-write` still runs once, because repeating it would write again.
 
@@ -204,6 +237,8 @@ mb read server-id --ip 127.0.0.1 --addr 1
 mb read fifo --ip 127.0.0.1 --addr 1 --unit 1
 mb read file --ip 127.0.0.1 --addr 1 --group 4:1:2 --group 3:9:2
 mb read device-id --ip 127.0.0.1 --addr 1 --code basic
+mb read device-id --ip 127.0.0.1 --addr 1 --code regular
+mb read device-id --ip 127.0.0.1 --addr 1 --code extended
 mb read device-id --ip 127.0.0.1 --addr 1 --code specific --object 0
 ```
 
@@ -255,7 +290,9 @@ FC 08 is a serial-line function. The memory server also answers it on TCP.
 
 ```bash
 mb diagnostics --ip 127.0.0.1 --addr 1 --sub return-query --data 0x1234
+mb diagnostics --ip 127.0.0.1 --addr 1 --sub echo --data 0x1234
 mb diagnostics --ip 127.0.0.1 --addr 1 --sub restart --data 0xFF00
+mb diagnostics --ip 127.0.0.1 --addr 1 --sub ascii-delimiter --data 0x0A00
 ```
 
 `--sub` accepts a name or a sub-function number. `echo` is another name for `return-query`. For `ascii-delimiter`, the character is the high byte of `--data`, so `0x0A00` sets the delimiter to line feed.
@@ -335,14 +372,17 @@ The tool automatically detects the protocol based on arguments:
 #### Industrial Automation
 
 ```bash
-# Read PLC outputs
-mb read coil --ip 192.168.1.10 --unit 0 --qty 16
+# Read PLC outputs at station 1
+mb read coil --ip 192.168.1.10 --addr 1 --unit 0 --qty 16
 
-# Read sensor values  
-mb read input --ip 192.168.1.10 --unit 1000 --qty 4 --verbose
+# Read sensor values
+mb read input --ip 192.168.1.10 --addr 1 --unit 1000 --qty 4 --verbose
+
+# Watch a holding block for 10 seconds
+mb read holding --ip 192.168.1.10 --addr 1 --unit 0 --qty 4 --timeout 10 --decode i32
 
 # Write setpoint
-mb write holding --ip 192.168.1.10 --unit 2000 --value 1500
+mb write holding --ip 192.168.1.10 --addr 1 --unit 2000 --value 1500
 ```
 
 #### Serial Device Communication
