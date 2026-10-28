@@ -28,10 +28,10 @@ The package name is `mb-rs`. That one install provides both commands, `mb_client
 
 ```bash
 mb_client completions bash
-mb_server --completions bash
+mb_server completions bash
 ```
 
-`completions` also accepts `zsh`, `fish`, `powershell`, and `elvish`. The server flag prints the script and exits.
+`completions` also accepts `zsh`, `fish`, `powershell`, and `elvish`. Both commands print the script and exit.
 
 ### From Source
 

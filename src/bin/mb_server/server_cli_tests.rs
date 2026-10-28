@@ -1,6 +1,6 @@
 //! Command-line parsing for `mb_server`.
 
-use crate::cli::{Cli, forced_fault, served_stations};
+use crate::cli::{Cli, Command, forced_fault, served_stations};
 use clap::Parser;
 
 #[test]
@@ -30,6 +30,18 @@ fn repeats_station_ids_and_rejects_broadcast() {
     assert_eq!(served_stations(&cli.units).unwrap(), vec![1, 2]);
     assert_eq!(served_stations(&[]).unwrap(), vec![1]);
     assert!(served_stations(&[0]).is_err());
+}
+
+#[test]
+fn completions_is_a_subcommand() {
+    let cli = Cli::try_parse_from(["mb_server", "completions", "bash"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Completions {
+            shell: clap_complete::Shell::Bash
+        })
+    ));
+    assert!(Cli::try_parse_from(["mb_server", "--completions", "bash"]).is_err());
 }
 
 #[test]

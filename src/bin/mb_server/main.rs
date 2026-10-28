@@ -11,7 +11,7 @@ mod snapshot;
 
 use anyhow::Context;
 use clap::{CommandFactory, Parser};
-use cli::{Cli, forced_fault, served_stations};
+use cli::{Cli, Command, forced_fault, served_stations};
 use runtime::{
     ModbusData, ServerListen, ServerRuntime, run_rtu_over_tcp_server, run_rtu_server,
     run_tcp_server, server_listen,
@@ -21,7 +21,7 @@ use snapshot::{load_file, save_file};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if let Some(shell) = cli.completions {
+    if let Some(Command::Completions { shell }) = cli.command {
         let mut command = Cli::command();
         write_completions(shell, &mut command, "mb_server")?;
         return Ok(());

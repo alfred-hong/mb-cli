@@ -1325,10 +1325,7 @@ fn completions_survive_a_closed_pipe() {
             env!("CARGO_BIN_EXE_mb_client"),
             &["completions", "bash"][..],
         ),
-        (
-            env!("CARGO_BIN_EXE_mb_server"),
-            &["--completions", "zsh"][..],
-        ),
+        (env!("CARGO_BIN_EXE_mb_server"), &["completions", "zsh"][..]),
     ] {
         let mut child = Command::new(bin)
             .args(args)

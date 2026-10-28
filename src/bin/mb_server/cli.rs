@@ -1,5 +1,5 @@
 use crate::serial::{DataBits, Parity, StopBits};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::{net::IpAddr, path::PathBuf};
 
 /// Modbus TCP and RTU memory server.
@@ -75,10 +75,6 @@ pub struct Cli {
     #[arg(long, short, display_order = 14)]
     pub verbose: bool,
 
-    /// Print a shell completion script and exit.
-    #[arg(long, value_enum, value_name = "SHELL", display_order = 20)]
-    pub completions: Option<clap_complete::Shell>,
-
     /// CSV file of `area,address,value` rows for coils, holding registers, and input registers
     #[arg(long, value_name = "FILE", display_order = 15)]
     pub csv: Option<PathBuf>,
@@ -102,6 +98,21 @@ pub struct Cli {
     /// Serve Modbus RTU frames on the TCP port instead of Modbus TCP
     #[arg(long = "rtu-over-tcp", conflicts_with = "device", display_order = 20)]
     pub rtu_over_tcp: bool,
+
+    /// `mb_server completions <shell>` prints a completion script and exits.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Commands that print and exit instead of serving.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Print a shell completion script to stdout.
+    Completions {
+        /// bash, elvish, fish, powershell, or zsh
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 /// Station ids fixed for this process. An empty list means station 1.
