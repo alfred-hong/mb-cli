@@ -27,3 +27,6 @@ This file provides agents with guidance when working in this project.
     ### Notes
     ```
     - Update the PLAN.md as you complete tasks
+
+## Documentation
+When a command-line flag, subcommand, default, accepted range, or printed error text changes, update `README.md` and `README-zh.md` in the same edit. `README.md` is English. `README-zh.md` is the complete Chinese translation of the same sections, commands, defaults, and limits. Keep the section order aligned. The edit is done when both files describe the same CLI.
