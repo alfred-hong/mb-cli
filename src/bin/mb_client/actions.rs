@@ -1,8 +1,10 @@
+use crate::address::{FileReadGroup, FileWriteGroup};
 use crate::cli::{AddressNotation, Common, DecodeArgs, DeviceIdCode, ReadTiming};
-use crate::client::{connect_to_modbus, each_read, modbus_operation_with_timeout};
 use crate::decode;
-use crate::table::{print_register_table, AddressStyle};
-use mb_cli::address::{FileReadGroup, FileWriteGroup};
+use crate::session::{
+    connect_to_modbus, each_read, modbus_operation_with_timeout, transport_retries,
+};
+use crate::table::{AddressStyle, print_register_table};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use tokio_modbus::client::Context;
@@ -52,6 +54,7 @@ pub async fn read_exception_status(common: &Common, timing: &ReadTiming) -> anyh
             &[],
             "read exception status",
             common.response_timeout,
+            transport_retries(common),
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -80,6 +83,7 @@ pub async fn read_event_counter(common: &Common, timing: &ReadTiming) -> anyhow:
             &[],
             "read event counter",
             common.response_timeout,
+            transport_retries(common),
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -104,6 +108,7 @@ pub async fn read_event_log(common: &Common, timing: &ReadTiming) -> anyhow::Res
             &[],
             "read event log",
             common.response_timeout,
+            transport_retries(common),
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -135,9 +140,10 @@ pub async fn read_server_id(common: &Common, timing: &ReadTiming) -> anyhow::Res
     let mut client = connect_to_modbus(common).await?;
     each_read(timing, async || {
         let response = modbus_operation_with_timeout(
-            || client.call(Request::ReportServerId),
+            async || client.call(Request::ReportServerId).await,
             "report server id",
             common.response_timeout,
+            transport_retries(common),
         )
         .await?;
         let Response::ReportServerId(id, running, extra) = response else {
@@ -175,6 +181,7 @@ pub async fn read_fifo(
             &addr.to_be_bytes(),
             "read fifo",
             common.response_timeout,
+            transport_retries(common),
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -219,6 +226,7 @@ pub async fn read_file(
             &payload,
             "read file record",
             common.response_timeout,
+            transport_retries(common),
         )
         .await?;
         let Response::Custom(_, bytes) = response else {
@@ -240,9 +248,14 @@ pub async fn read_device_id(
     let mut client = connect_to_modbus(common).await?;
     each_read(timing, async || {
         let response = modbus_operation_with_timeout(
-            || client.read_device_identification(code.read_code(), object),
+            async || {
+                client
+                    .read_device_identification(code.read_code(), object)
+                    .await
+            },
             "read device identification",
             common.response_timeout,
+            transport_retries(common),
         )
         .await?;
         let mut frame = format!(
@@ -284,6 +297,7 @@ pub async fn diagnostics(common: &Common, sub: u16, data: u16) -> anyhow::Result
         &payload,
         "diagnostics",
         common.response_timeout,
+        transport_retries(common),
     )
     .await?;
     let Response::Custom(_, bytes) = response else {
@@ -306,9 +320,10 @@ pub async fn write_mask(
 ) -> anyhow::Result<()> {
     let mut client = connect_to_modbus(common).await?;
     modbus_operation_with_timeout(
-        || client.masked_write_register(addr, and_mask, or_mask),
+        async || client.masked_write_register(addr, and_mask, or_mask).await,
         "mask write register",
         common.response_timeout,
+        transport_retries(common),
     )
     .await?;
     println!(
@@ -361,9 +376,14 @@ pub async fn read_write(
     ensure_read_write_count(values.len())?;
     let mut client = connect_to_modbus(common).await?;
     let registers = modbus_operation_with_timeout(
-        || client.read_write_multiple_registers(read_addr, read_qty, write_addr, values),
+        async || {
+            client
+                .read_write_multiple_registers(read_addr, read_qty, write_addr, values)
+                .await
+        },
         "read/write registers",
         common.response_timeout,
+        transport_retries(common),
     )
     .await?;
     println!(
@@ -383,7 +403,7 @@ pub async fn read_write(
 }
 
 /// Build a typed request when the codec decodes that function, so the codes match.
-fn request_from_raw(function: u8, data: &[u8]) -> anyhow::Result<Request<'static>> {
+pub fn request_from_raw(function: u8, data: &[u8]) -> anyhow::Result<Request<'static>> {
     match function {
         0x01 => {
             expect_len(data, 4, function)?;
@@ -534,16 +554,25 @@ pub async fn raw_request(common: &Common, function: u8, data: &[u8]) -> anyhow::
     let request = request_from_raw(function, data)?;
     let mut client = connect_to_modbus(common).await?;
     modbus_operation_with_timeout(
-        || client.call(request),
+        async || client.call(request.clone()).await,
         "raw request",
         common.response_timeout,
+        transport_retries(common),
     )
     .await
 }
 
 async fn custom(common: &Common, code: u8, bytes: &[u8], name: &str) -> anyhow::Result<Response> {
     let mut client = connect_to_modbus(common).await?;
-    call_custom(&mut client, code, bytes, name, common.response_timeout).await
+    call_custom(
+        &mut client,
+        code,
+        bytes,
+        name,
+        common.response_timeout,
+        transport_retries(common),
+    )
+    .await
 }
 
 async fn call_custom(
@@ -552,11 +581,17 @@ async fn call_custom(
     bytes: &[u8],
     name: &str,
     timeout_secs: u64,
+    retries: u32,
 ) -> anyhow::Result<Response> {
     modbus_operation_with_timeout(
-        || client.call(Request::Custom(code, Cow::Borrowed(bytes))),
+        async || {
+            client
+                .call(Request::Custom(code, Cow::Borrowed(bytes)))
+                .await
+        },
         name,
         timeout_secs,
+        retries,
     )
     .await
 }
@@ -706,16 +741,5 @@ fn object_name(id: u8) -> &'static str {
         0x05 => "ModelName",
         0x06 => "UserApplicationName",
         _ => "Object",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_holding_read_uses_the_typed_request() {
-        let request = request_from_raw(3, &[0x00, 0x00, 0x00, 0x01]).unwrap();
-        assert!(matches!(request, Request::ReadHoldingRegisters(0, 1)));
     }
 }

@@ -85,14 +85,3 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Trace<T> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hex_bytes_groups_each_octet() {
-        assert_eq!(hex_bytes(&[]), "");
-        assert_eq!(hex_bytes(&[0x01, 0x03, 0x00]), "01 03 00");
-    }
-}

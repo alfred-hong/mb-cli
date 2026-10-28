@@ -1,20 +1,24 @@
-use tokio_modbus::client::{Reader, Writer};
-
 mod actions;
+mod address;
 mod cli;
-mod client;
 mod decode;
 mod output;
+mod serial;
+mod session;
 mod table;
 mod trace;
 
+use tokio_modbus::client::{Reader, Writer};
+
 use actions::{area_style, ensure_write_coil_count, ensure_write_register_count, reject_readonly};
-use cli::{parse_hex_payload, Cli, Command, ReadArea, WriteArea};
-use client::{connect_to_modbus, each_read, modbus_operation_with_timeout};
+use cli::{Cli, Command, ReadArea, WriteArea, parse_hex_payload};
 use decode::ensure_decode_flags;
+use session::{connect_to_modbus, each_read, modbus_operation_with_timeout, transport_retries};
 use table::{print_coil_table, print_register_table, write_coil_table};
 
-use clap::Parser;
+use std::io::Write;
+
+use clap::{CommandFactory, Parser};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -43,9 +47,10 @@ async fn main() -> anyhow::Result<()> {
                 let mut client = connect_to_modbus(&common).await?;
                 each_read(&timing, async || {
                     let coils = modbus_operation_with_timeout(
-                        || client.read_coils(start, qty),
+                        async || client.read_coils(start, qty).await,
                         "read coils",
                         common.response_timeout,
+                        transport_retries(&common),
                     )
                     .await?;
                     let mut frame = format!(
@@ -67,9 +72,10 @@ async fn main() -> anyhow::Result<()> {
                 let mut client = connect_to_modbus(&common).await?;
                 each_read(&timing, async || {
                     let inputs = modbus_operation_with_timeout(
-                        || client.read_discrete_inputs(start, qty),
+                        async || client.read_discrete_inputs(start, qty).await,
                         "read discrete inputs",
                         common.response_timeout,
+                        transport_retries(&common),
                     )
                     .await?;
                     let mut frame = format!(
@@ -93,9 +99,10 @@ async fn main() -> anyhow::Result<()> {
                 let mut client = connect_to_modbus(&common).await?;
                 each_read(&timing, async || {
                     let registers = modbus_operation_with_timeout(
-                        || client.read_holding_registers(start, qty),
+                        async || client.read_holding_registers(start, qty).await,
                         "read holding registers",
                         common.response_timeout,
+                        transport_retries(&common),
                     )
                     .await?;
                     let mut frame = format!(
@@ -126,9 +133,10 @@ async fn main() -> anyhow::Result<()> {
                 let mut client = connect_to_modbus(&common).await?;
                 each_read(&timing, async || {
                     let registers = modbus_operation_with_timeout(
-                        || client.read_input_registers(start, qty),
+                        async || client.read_input_registers(start, qty).await,
                         "read input registers",
                         common.response_timeout,
+                        transport_retries(&common),
                     )
                     .await?;
                     let mut frame = format!(
@@ -195,9 +203,10 @@ async fn main() -> anyhow::Result<()> {
                 if bool_values.len() == 1 {
                     // Single coil write (FC 5)
                     modbus_operation_with_timeout(
-                        || client.write_single_coil(start, bool_values[0]),
+                        async || client.write_single_coil(start, bool_values[0]).await,
                         "write coil",
                         common.response_timeout,
+                        transport_retries(&common),
                     )
                     .await?;
                     println!(
@@ -208,9 +217,10 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     // Multiple coils write (FC 15)
                     modbus_operation_with_timeout(
-                        || client.write_multiple_coils(start, &bool_values),
+                        async || client.write_multiple_coils(start, &bool_values).await,
                         "write coils",
                         common.response_timeout,
+                        transport_retries(&common),
                     )
                     .await?;
                     println!(
@@ -233,9 +243,10 @@ async fn main() -> anyhow::Result<()> {
                 if values.len() == 1 {
                     // Single register write (FC 6)
                     modbus_operation_with_timeout(
-                        || client.write_single_register(start, values[0]),
+                        async || client.write_single_register(start, values[0]).await,
                         "write register",
                         common.response_timeout,
+                        transport_retries(&common),
                     )
                     .await?;
                     if common.verbose {
@@ -252,9 +263,10 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     // Multiple registers write (FC 16)
                     modbus_operation_with_timeout(
-                        || client.write_multiple_registers(start, &values),
+                        async || client.write_multiple_registers(start, &values).await,
                         "write registers",
                         common.response_timeout,
+                        transport_retries(&common),
                     )
                     .await?;
                     println!(
@@ -322,9 +334,29 @@ async fn main() -> anyhow::Result<()> {
             decode,
             common,
         } => actions::read_write(&common, read_addr, read_qty, start, &values, &decode).await?,
+        Command::Completions { shell } => {
+            let mut command = Cli::command();
+            write_completions(shell, &mut command, "mb_client")?;
+        }
     }
 
     Ok(())
+}
+
+/// Write a completion script. A closed pipe is a normal end, not a panic.
+fn write_completions(
+    shell: clap_complete::Shell,
+    command: &mut clap::Command,
+    bin_name: &str,
+) -> anyhow::Result<()> {
+    let mut script = Vec::new();
+    clap_complete::generate(shell, command, bin_name, &mut script);
+    let mut out = std::io::stdout().lock();
+    match std::io::Write::write_all(&mut out, &script).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Clap reports a flag used before the subcommand as an unexpected argument.
@@ -346,7 +378,36 @@ fn connection_flag_before_command(text: &str) -> bool {
         "'-v'",
         "'--notation'",
         "'--response-timeout'",
+        "'--retries'",
     ]
     .iter()
     .any(|flag| text.contains(flag))
 }
+
+#[cfg(test)]
+#[path = "client_actions_tests.rs"]
+mod client_actions_tests;
+
+#[cfg(test)]
+#[path = "client_cli_tests.rs"]
+mod client_cli_tests;
+
+#[cfg(test)]
+#[path = "client_decode_tests.rs"]
+mod client_decode_tests;
+
+#[cfg(test)]
+#[path = "client_output_tests.rs"]
+mod client_output_tests;
+
+#[cfg(test)]
+#[path = "client_retry_tests.rs"]
+mod client_retry_tests;
+
+#[cfg(test)]
+#[path = "client_table_tests.rs"]
+mod client_table_tests;
+
+#[cfg(test)]
+#[path = "client_trace_tests.rs"]
+mod client_trace_tests;

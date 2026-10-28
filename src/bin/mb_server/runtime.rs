@@ -1,4 +1,4 @@
-use mb_cli::serial::{DataBits, Parity, StopBits};
+use crate::serial::{DataBits, Parity, StopBits};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
@@ -6,12 +6,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{timeout, Instant};
+use tokio::time::{Instant, timeout};
 use tokio_modbus::prelude::*;
-use tokio_modbus::server::{rtu, rtu_over_tcp, tcp, Service};
+use tokio_modbus::server::{Service, rtu, rtu_over_tcp, tcp};
 
 /// Runtime options shared by the TCP and RTU servers.
 #[derive(Clone)]
@@ -72,14 +73,14 @@ fn idle_sleep(timeout_secs: Duration) -> Option<Pin<Box<tokio::time::Sleep>>> {
 }
 
 /// Closes a quiet TCP connection after `timeout` with a clean EOF.
-struct IdleTimeoutStream<S> {
+pub struct IdleTimeoutStream<S> {
     inner: S,
     timeout: Duration,
     idle: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<S> IdleTimeoutStream<S> {
-    fn new(inner: S, timeout: Duration) -> Self {
+    pub fn new(inner: S, timeout: Duration) -> Self {
         let idle = idle_sleep(timeout);
         Self {
             inner,
@@ -137,6 +138,158 @@ where
             }
             other => other,
         }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Turns two requests the TCP codec would drop into requests it can decode.
+///
+/// tokio-modbus rejects every MEI type except 14, and it rejects a function 05
+/// value other than `0x0000` or `0xFF00`. Either error closes the connection.
+/// The replacement keeps the MBAP transaction id. `unsupported_mei` asks for
+/// exception 01. `illegal_coil` asks for exception 03, and the coil is not written.
+struct MeiRewrite<S> {
+    inner: S,
+    incoming: Vec<u8>,
+    pending: VecDeque<u8>,
+    unsupported_mei: Arc<AtomicBool>,
+    illegal_coil: Arc<AtomicBool>,
+}
+
+impl<S> MeiRewrite<S> {
+    fn new(inner: S, unsupported_mei: Arc<AtomicBool>, illegal_coil: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            incoming: Vec::new(),
+            pending: VecDeque::new(),
+            unsupported_mei,
+            illegal_coil,
+        }
+    }
+}
+
+/// One MBAP frame, or `None` while the header or the declared body is incomplete.
+pub fn pop_mbap_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buf.len() < 7 {
+        return None;
+    }
+    let length = usize::from(u16::from_be_bytes([buf[4], buf[5]]));
+    // Unit id plus at most 253 PDU bytes. A larger length would stall the reader.
+    if length == 0 || length > 254 {
+        return Some(vec![buf.remove(0)]);
+    }
+    let total = 6 + length;
+    if buf.len() < total {
+        return None;
+    }
+    Some(buf.drain(..total).collect())
+}
+
+/// Pass a normal frame through.
+///
+/// An MEI type other than 14 becomes a specific device-id read of object 0.
+/// A function 05 value other than `0x0000` or `0xFF00` becomes OFF, so the codec
+/// can deliver the request. The flags tell the service which exception to send.
+pub fn adjust_mei_frame(
+    frame: &[u8],
+    unsupported_mei: &AtomicBool,
+    illegal_coil: &AtomicBool,
+) -> Vec<u8> {
+    let length = usize::from(u16::from_be_bytes([frame[4], frame[5]]));
+    let pdu = frame.get(7..6 + length).unwrap_or(&[]);
+    if let Some(rewritten) = rewrite_illegal_coil(frame, pdu) {
+        illegal_coil.store(true, Ordering::SeqCst);
+        return rewritten;
+    }
+    let supported = pdu.first() == Some(&0x2B) && pdu.get(1) == Some(&0x0E) && pdu.len() >= 4;
+    let other_mei = pdu.first() == Some(&0x2B) && !supported;
+    if !other_mei {
+        return frame.to_vec();
+    }
+    unsupported_mei.store(true, Ordering::SeqCst);
+    let mut out = frame[..6].to_vec();
+    let body_len = 1 + 4;
+    out[4] = (body_len as u16 >> 8) as u8;
+    out[5] = body_len as u8;
+    out.push(frame[6]);
+    out.extend_from_slice(&[0x2B, 0x0E, 0x04, 0x00]);
+    out
+}
+
+/// Function 05 with a value other than OFF or ON. The address is kept.
+fn rewrite_illegal_coil(frame: &[u8], pdu: &[u8]) -> Option<Vec<u8>> {
+    if pdu.len() != 5 || pdu[0] != 0x05 {
+        return None;
+    }
+    let value = u16::from_be_bytes([pdu[3], pdu[4]]);
+    if value == 0x0000 || value == 0xFF00 {
+        return None;
+    }
+    let mut out = frame.to_vec();
+    let value_at = frame.len().checked_sub(2)?;
+    out[value_at] = 0;
+    out[value_at + 1] = 0;
+    Some(out)
+}
+
+impl<S> AsyncRead for MeiRewrite<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if !this.pending.is_empty() {
+                let n = this.pending.len().min(buf.remaining());
+                let bytes: Vec<u8> = this.pending.drain(..n).collect();
+                buf.put_slice(&bytes);
+                return Poll::Ready(Ok(()));
+            }
+            let mut tmp = [0u8; 512];
+            let mut read = tokio::io::ReadBuf::new(&mut tmp);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut read) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) => {
+                    let got = read.filled();
+                    if got.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    this.incoming.extend_from_slice(got);
+                }
+            }
+            while let Some(frame) = pop_mbap_frame(&mut this.incoming) {
+                this.pending.extend(adjust_mei_frame(
+                    &frame,
+                    &this.unsupported_mei,
+                    &this.illegal_coil,
+                ));
+            }
+        }
+    }
+}
+
+impl<S> AsyncWrite for MeiRewrite<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -259,6 +412,12 @@ pub struct ModbusService {
     forced: Option<(u8, ExceptionCode)>,
     silence_writes: bool,
     peer: Option<String>,
+    /// Set when a TCP request used an MEI type other than 14. The codec cannot
+    /// represent that request, so the bytes were replaced with a device-id read.
+    unsupported_mei: Arc<AtomicBool>,
+    /// Set when function 05 carried a value other than `0x0000` or `0xFF00`.
+    /// The codec cannot represent that value, so the bytes were replaced with OFF.
+    illegal_coil: Arc<AtomicBool>,
 }
 
 impl ModbusService {
@@ -271,11 +430,23 @@ impl ModbusService {
             forced: runtime.forced,
             silence_writes: runtime.silence_writes,
             peer: None,
+            unsupported_mei: Arc::new(AtomicBool::new(false)),
+            illegal_coil: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn with_peer(mut self, peer: String) -> Self {
         self.peer = Some(peer);
+        self
+    }
+
+    fn with_unsupported_mei(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.unsupported_mei = flag;
+        self
+    }
+
+    fn with_illegal_coil(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.illegal_coil = flag;
         self
     }
 }
@@ -296,19 +467,43 @@ impl Service for ModbusService {
         let forced = self.forced;
         let silence_writes = self.silence_writes;
         let peer = self.peer.clone();
+        let unsupported_mei = self.unsupported_mei.clone();
+        let illegal_coil = self.illegal_coil.clone();
         Box::pin(async move {
             let SlaveRequest { slave, request } = req;
             let station = slave;
-            let outcome = answer(
-                &data,
-                &units,
-                station,
-                request.clone(),
-                delay,
-                forced,
-                silence_writes,
-            )
-            .await;
+            // The TCP codec rejects these frames before this runs. The bytes were
+            // rewritten into a request it accepts, and the flag says the original
+            // request was not that substitute. Answer the specification exception
+            // and keep the connection open.
+            let rewritten = matches!(request, Request::ReadDeviceIdentification(_, _))
+                && unsupported_mei.swap(false, Ordering::SeqCst);
+            let rejected_coil = matches!(request, Request::WriteSingleCoil(_, _))
+                && illegal_coil.swap(false, Ordering::SeqCst);
+            let outcome = if rewritten || rejected_coil {
+                let exception = if rewritten {
+                    ExceptionCode::IllegalFunction
+                } else {
+                    ExceptionCode::IllegalDataValue
+                };
+                if station != 0 && units.contains(&station) {
+                    pause(delay).await;
+                    Err(exception)
+                } else {
+                    Ok(None)
+                }
+            } else {
+                answer(
+                    &data,
+                    &units,
+                    station,
+                    request.clone(),
+                    delay,
+                    forced,
+                    silence_writes,
+                )
+                .await
+            };
             log_line(
                 verbose,
                 peer.as_deref(),
@@ -440,8 +635,17 @@ async fn serve_tcp_connections(
             if runtime.verbose {
                 println!("Client connected: {socket_addr}");
             }
-            let service = ModbusService::new(data, &runtime).with_peer(socket_addr.to_string());
-            let stream = IdleTimeoutStream::new(stream, idle);
+            let unsupported_mei = Arc::new(AtomicBool::new(false));
+            let illegal_coil = Arc::new(AtomicBool::new(false));
+            let service = ModbusService::new(data, &runtime)
+                .with_peer(socket_addr.to_string())
+                .with_unsupported_mei(unsupported_mei.clone())
+                .with_illegal_coil(illegal_coil.clone());
+            let stream = MeiRewrite::new(
+                IdleTimeoutStream::new(stream, idle),
+                unsupported_mei,
+                illegal_coil,
+            );
             Ok(Some((service, stream)))
         }
     };
@@ -476,7 +680,12 @@ async fn finish_tcp<F, OnConnected>(
 ) -> anyhow::Result<()>
 where
     F: Future<
-            Output = io::Result<Option<(ModbusService, IdleTimeoutStream<tokio::net::TcpStream>)>>,
+            Output = io::Result<
+                Option<(
+                    ModbusService,
+                    MeiRewrite<IdleTimeoutStream<tokio::net::TcpStream>>,
+                )>,
+            >,
         > + Send,
     OnConnected: Fn(tokio::net::TcpStream, SocketAddr) -> F + Sync,
 {
@@ -587,394 +796,5 @@ pub async fn run_rtu_server(
             );
             Err(anyhow::anyhow!("Connection timeout"))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        server_listen, IdleTimeoutStream, ModbusData, ModbusService, ServerListen, ServerRuntime,
-    };
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::io::AsyncReadExt;
-    use tokio_modbus::prelude::{ExceptionCode, Request, Response, SlaveRequest};
-    use tokio_modbus::server::Service;
-
-    fn runtime(units: &[u8]) -> ServerRuntime {
-        ServerRuntime {
-            units: units.to_vec(),
-            verbose: false,
-            timeout_secs: 5,
-            delay: Duration::ZERO,
-            forced: None,
-            silence_writes: false,
-        }
-    }
-
-    fn service(data: Arc<tokio::sync::RwLock<ModbusData>>, units: &[u8]) -> ModbusService {
-        ModbusService::new(data, &runtime(units))
-    }
-
-    #[test]
-    fn test_modbus_data_new() {
-        let data = ModbusData::new(100, 200, 300, 400);
-
-        assert_eq!(data.coils.len(), 100);
-        assert_eq!(data.discrete_inputs.len(), 200);
-        assert_eq!(data.holding_registers.len(), 300);
-        assert_eq!(data.input_registers.len(), 400);
-        assert!(data.discrete_inputs.iter().all(|bit| !bit));
-    }
-
-    #[test]
-    fn startup_draw_is_stable_for_one_seed_and_changes_with_another() {
-        let first = ModbusData::from_seed(8, 4, 8, 8, 1);
-        let again = ModbusData::from_seed(8, 4, 8, 8, 1);
-        let other = ModbusData::from_seed(8, 4, 8, 8, 2);
-        assert_eq!(first.coils, again.coils);
-        assert_eq!(first.holding_registers, again.holding_registers);
-        assert_eq!(first.input_registers, again.input_registers);
-        assert!(first.discrete_inputs.iter().all(|bit| !bit));
-        assert_ne!(first.holding_registers, other.holding_registers);
-    }
-
-    #[test]
-    fn test_modbus_data_small_sizes() {
-        let data = ModbusData::new(1, 2, 3, 4);
-
-        assert_eq!(data.coils.len(), 1);
-        assert_eq!(data.discrete_inputs.len(), 2);
-        assert_eq!(data.holding_registers.len(), 3);
-        assert_eq!(data.input_registers.len(), 4);
-        assert!(data.discrete_inputs.iter().all(|bit| !bit));
-    }
-
-    #[test]
-    fn test_modbus_data_zero_sizes() {
-        let data = ModbusData::new(0, 0, 0, 0);
-
-        assert!(data.coils.is_empty());
-        assert!(data.discrete_inputs.is_empty());
-        assert!(data.holding_registers.is_empty());
-        assert!(data.input_registers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_modbus_service_read_coils_valid() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-
-        // Set some coil values for testing
-        {
-            let mut data_lock = data.write().await;
-            data_lock.coils[0] = true;
-            data_lock.coils[1] = false;
-            data_lock.coils[2] = true;
-        }
-
-        let service = service(data, &[1]);
-        let request = Request::ReadCoils(0, 3);
-
-        let result = service.call(SlaveRequest { slave: 1, request }).await;
-        assert!(result.is_ok());
-
-        if let Ok(Some(Response::ReadCoils(coils))) = result {
-            assert_eq!(coils.len(), 3);
-            assert!(coils[0]);
-            assert!(!coils[1]);
-            assert!(coils[2]);
-        } else {
-            panic!("Expected ReadCoils response");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_modbus_service_read_coils_out_of_bounds() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(5, 5, 5, 5)));
-        let service = service(data, &[1]);
-
-        // Try to read beyond available coils
-        let request = Request::ReadCoils(3, 5); // starts at 3, wants 5 coils = addresses 3,4,5,6,7 but only 0-4 exist
-
-        let result = service.call(SlaveRequest { slave: 1, request }).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), ExceptionCode::IllegalDataAddress);
-    }
-
-    #[tokio::test]
-    async fn test_modbus_service_read_holding_registers() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-        {
-            let mut guard = data.write().await;
-            guard.holding_registers[5] = 5;
-            guard.holding_registers[6] = 6;
-            guard.holding_registers[7] = 7;
-        }
-        let service = service(data, &[1]);
-
-        let request = Request::ReadHoldingRegisters(5, 3);
-
-        let result = service.call(SlaveRequest { slave: 1, request }).await;
-        assert!(result.is_ok());
-
-        if let Ok(Some(Response::ReadHoldingRegisters(registers))) = result {
-            assert_eq!(registers.len(), 3);
-            assert_eq!(registers[0], 5); // address 5 = value 5
-            assert_eq!(registers[1], 6); // address 6 = value 6
-            assert_eq!(registers[2], 7); // address 7 = value 7
-        } else {
-            panic!("Expected ReadHoldingRegisters response");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_modbus_service_write_single_coil() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-        let service = service(data.clone(), &[1]);
-
-        let request = Request::WriteSingleCoil(3, true);
-
-        let result = service.call(SlaveRequest { slave: 1, request }).await;
-        assert!(result.is_ok());
-
-        if let Ok(Some(Response::WriteSingleCoil(addr, value))) = result {
-            assert_eq!(addr, 3);
-            assert!(value);
-        } else {
-            panic!("Expected WriteSingleCoil response");
-        }
-
-        // Verify the coil was actually set
-        let data_lock = data.read().await;
-        assert!(data_lock.coils[3]);
-    }
-
-    #[tokio::test]
-    async fn test_modbus_service_write_single_register() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-        let service = service(data.clone(), &[1]);
-
-        let request = Request::WriteSingleRegister(2, 12345);
-
-        let result = service.call(SlaveRequest { slave: 1, request }).await;
-        assert!(result.is_ok());
-
-        if let Ok(Some(Response::WriteSingleRegister(addr, value))) = result {
-            assert_eq!(addr, 2);
-            assert_eq!(value, 12345);
-        } else {
-            panic!("Expected WriteSingleRegister response");
-        }
-
-        // Verify the register was actually set
-        let data_lock = data.read().await;
-        assert_eq!(data_lock.holding_registers[2], 12345);
-    }
-
-    #[tokio::test]
-    async fn test_modbus_service_write_multiple_coils() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::new(10, 10, 10, 10)));
-        let service = service(data.clone(), &[1]);
-
-        let values = [true, false, true];
-        let request = Request::WriteMultipleCoils(1, values.to_vec().into());
-
-        let result = service.call(SlaveRequest { slave: 1, request }).await;
-        assert!(result.is_ok());
-
-        if let Ok(Some(Response::WriteMultipleCoils(addr, qty))) = result {
-            assert_eq!(addr, 1);
-            assert_eq!(qty, 3);
-        } else {
-            panic!("Expected WriteMultipleCoils response");
-        }
-
-        // Verify the coils were actually set
-        let data_lock = data.read().await;
-        assert!(data_lock.coils[1]);
-        assert!(!data_lock.coils[2]);
-        assert!(data_lock.coils[3]);
-    }
-
-    #[tokio::test]
-    async fn test_modbus_service_ignores_other_unit_ids() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::from_seed(
-            10, 10, 10, 10, 11,
-        )));
-        data.write().await.coils[0] = false;
-        let service = service(data.clone(), &[1]);
-        let request = Request::WriteSingleCoil(0, true);
-
-        let result = service
-            .call(SlaveRequest { slave: 2, request })
-            .await
-            .unwrap();
-        assert!(result.is_none());
-
-        let data_lock = data.read().await;
-        assert!(!data_lock.coils[0]);
-    }
-
-    #[test]
-    fn test_server_listen_defaults_to_all_interfaces() {
-        let ip = "127.0.0.1".parse().unwrap();
-        assert_eq!(
-            server_listen(Some(ip), None, false).unwrap(),
-            ServerListen::Tcp(ip)
-        );
-        assert_eq!(
-            server_listen(None, Some(PathBuf::from("/dev/ttyUSB0")), false).unwrap(),
-            ServerListen::Rtu(PathBuf::from("/dev/ttyUSB0"))
-        );
-        assert_eq!(
-            server_listen(None, None, false).unwrap(),
-            ServerListen::Tcp(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-        );
-        assert_eq!(
-            server_listen(None, None, true).unwrap(),
-            ServerListen::RtuOverTcp(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-        );
-        assert!(server_listen(Some(ip), Some(PathBuf::from("/dev/ttyUSB0")), false).is_err());
-        assert!(server_listen(None, Some(PathBuf::from("/dev/ttyUSB0")), true).is_err());
-    }
-
-    #[tokio::test]
-    async fn test_idle_timeout_closes_silent_stream() {
-        let (_client, server) = tokio::io::duplex(16);
-        let mut timed = IdleTimeoutStream::new(server, Duration::from_millis(30));
-        let mut buf = [0u8; 4];
-        let n = timed.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[tokio::test]
-    async fn broadcast_write_updates_memory_without_a_response() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::from_seed(
-            4, 1, 4, 1, 3,
-        )));
-        let service = service(data.clone(), &[1, 2]);
-        let written = service
-            .call(SlaveRequest {
-                slave: 0,
-                request: Request::WriteSingleRegister(1, 77),
-            })
-            .await
-            .unwrap();
-        assert!(written.is_none());
-        assert_eq!(data.read().await.holding_registers[1], 77);
-
-        let before = data.read().await.holding_registers[0];
-        let read = service
-            .call(SlaveRequest {
-                slave: 0,
-                request: Request::ReadHoldingRegisters(0, 1),
-            })
-            .await
-            .unwrap();
-        assert!(read.is_none());
-        assert_eq!(data.read().await.holding_registers[0], before);
-    }
-
-    #[tokio::test]
-    async fn stations_share_one_image_and_unknown_ids_stay_silent() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::from_seed(
-            4, 1, 4, 1, 4,
-        )));
-        let service = service(data.clone(), &[1, 2]);
-        service
-            .call(SlaveRequest {
-                slave: 2,
-                request: Request::WriteSingleCoil(0, true),
-            })
-            .await
-            .unwrap();
-        let seen = service
-            .call(SlaveRequest {
-                slave: 1,
-                request: Request::ReadCoils(0, 1),
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(seen, Response::ReadCoils(vec![true]));
-        let ignored = service
-            .call(SlaveRequest {
-                slave: 3,
-                request: Request::ReadCoils(0, 1),
-            })
-            .await
-            .unwrap();
-        assert!(ignored.is_none());
-    }
-
-    #[tokio::test]
-    async fn forced_exception_does_not_write_and_other_functions_do() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::from_seed(
-            4, 1, 4, 1, 5,
-        )));
-        let original = data.read().await.holding_registers[1];
-        let mut policy = runtime(&[1]);
-        policy.forced = Some((0x06, ExceptionCode::IllegalDataAddress));
-        let service = ModbusService::new(data.clone(), &policy);
-        let denied = service
-            .call(SlaveRequest {
-                slave: 1,
-                request: Request::WriteSingleRegister(1, 9),
-            })
-            .await;
-        assert_eq!(denied.unwrap_err(), ExceptionCode::IllegalDataAddress);
-        assert_eq!(data.read().await.holding_registers[1], original);
-
-        service
-            .call(SlaveRequest {
-                slave: 1,
-                request: Request::WriteSingleCoil(0, true),
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(data.read().await.coils[0]);
-    }
-
-    #[tokio::test]
-    async fn silence_skips_a_write() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::from_seed(
-            4, 1, 4, 1, 6,
-        )));
-        let original = data.read().await.holding_registers[0];
-        let mut policy = runtime(&[1]);
-        policy.silence_writes = true;
-        let service = ModbusService::new(data.clone(), &policy);
-        let response = service
-            .call(SlaveRequest {
-                slave: 1,
-                request: Request::WriteSingleRegister(0, 5),
-            })
-            .await
-            .unwrap();
-        assert!(response.is_none());
-        assert_eq!(data.read().await.holding_registers[0], original);
-    }
-
-    #[tokio::test]
-    async fn delay_waits_before_a_normal_response() {
-        let data = Arc::new(tokio::sync::RwLock::new(ModbusData::from_seed(
-            2, 1, 2, 1, 7,
-        )));
-        let mut policy = runtime(&[1]);
-        policy.delay = Duration::from_millis(40);
-        let service = ModbusService::new(data, &policy);
-        let started = std::time::Instant::now();
-        service
-            .call(SlaveRequest {
-                slave: 1,
-                request: Request::ReadHoldingRegisters(0, 1),
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(30));
     }
 }

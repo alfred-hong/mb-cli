@@ -1,13 +1,13 @@
 [package]
-name = "mb-cli"
+name = "mb-rs"
 version = "1.2.2"
-edition = "2021"
+edition = "2024"
 rust-version = "1.85"
 authors = ["Warren Krettek <warrenkrettek@gmail.com>"]
 description = "Modbus TCP and RTU client (mb_client) and memory server (mb_server)"
 readme = "README.md"
-homepage = "https://github.com/wkrettek/mb-cli"
-repository = "https://github.com/wkrettek/mb-cli"
+homepage = "https://github.com/alfred-hong/mb-rs"
+repository = "https://github.com/alfred-hong/mb-rs"
 license = "MIT OR Apache-2.0"
 keywords = ["modbus", "industrial", "iot", "automation"]
 categories = ["command-line-utilities", "network-programming"]
@@ -16,21 +16,12 @@ exclude = [
     "AGENTS.md"
 ]
 
-[lib]
-name = "mb_cli"
-path = "src/lib.rs"
-
-[[bin]]
-name = "mb_client"
-path = "src/bin/mb_client/main.rs"
-
-[[bin]]
-name = "mb_server"
-path = "src/bin/mb_server/main.rs"
-
 [dependencies]
 anyhow = "1.0.104"
+backon = { version = "1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
 clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+jiff = { version = "0.2.38", default-features = false, features = ["std"] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-modbus = { version = "0.17.0", features = ["tcp-server", "rtu-server", "rtu-over-tcp-server"] }
 tokio-serial = "5.5.0"

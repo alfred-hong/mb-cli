@@ -77,7 +77,7 @@
         - [x] Quantity, address, file, station, interval, and diagnostics errors name the accepted range and stop before connecting
         - [x] Decode flags without `--decode` stop before connecting
         - [x] Each connection, timeout, and exception message is printed once
-    - [ ] Retry logic
+    - [x] Retry logic: `--retries` defaults to 2 extra attempts for a timeout or a broken connection, then the command stops. Modbus exceptions and station 0 are not retried.
     - [x] Timeout configuration
 - [x] Add basic unit tests for fast execution (28 tests total)
     - [x] CLI validation tests (6 tests)
@@ -153,7 +153,7 @@
 - [x] README examples cover station flags, area addresses, every decode format, and live reads
 
 ## Align documentation with runtime
-- [x] Install the `mb_client` and `mb_server` binaries from the `mb-cli` package
+- [x] Install the `mb_client` and `mb_server` binaries from the `mb-rs` package
 - [x] Server requires `--ip` or `--device`
 - [x] Server `--unit` answers only that id
 - [x] Server `--verbose` / `-v` logs each request and the TCP client address
@@ -257,6 +257,64 @@ A later check of rs-modbus 2.0, rmodbus 0.12, rodbus 1.5, and rusty-modbus-codec
 - [x] `--verbose` prints transmitted and received bytes
 - [x] `--notation modicon` prints 00001 / 10001 / 30001 / 40001, and six digits past offset 9999
 - [x] One raw function code, ModScan's user command (`mb_client raw`)
-- [ ] ModScan test script: name, station, function, address, length, data, and an expected result of data, exception 01/02/04, or no response. Deliberately bad CRC stays out
+- [ ] ModScan test script: name, station, function, address, length, data, and an expected result of data, exception 01/02/04, or no response. Deliberately bad CRC stays out. The file format is not settled.
+- [x] Shell completion scripts for `mb_client` and `mb_server`
+- [x] Log timestamps use `jiff` and stay `YYYY-MM-DDTHH:MM:SSZ`
 - [ ] ASCII, UDP, and RS-485 RTS timing stay deferred with the server. The current library does not provide them
+
+## Packaging check
+
+Run the full suite and compare each result with the README and the Modbus specification. Fix the code when a result disagrees.
+
+- [x] `cargo test --offline --all-targets` (112 tests)
+- [x] Live client and server behavior matches the README
+- [x] Exception codes, quantity limits, broadcast, and device identity match the specification
+
+The release binaries matched the V1.1b3 examples that were checked: mask result `0x0017`, FIFO count 2 left in place, FIFO count 32 as exception 03, quantity 0 and 126 and 2001 as exception 03, an address past the window as exception 02, broadcast stored with no response, and device identification conformity `0x82`. A TCP function 05 value other than `0x0000` or `0xFF00` used to drop the connection. It now returns exception 03 and leaves the coil unchanged.
+
+## Independent binaries in one package
+
+Each command lives under its own `src/bin/mb_*` directory, with its own copy of address parsing and serial settings. `cargo install` of `mb-rs` installs both `mb_client` and `mb_server`.
+
+- [x] Copy client code, server code, and the shared sources into `src/bin/mb_client` and `src/bin/mb_server`
+- [x] Install both commands from the single `mb-rs` package and keep the tests green
+
+## Edition 2024 and tests directory
+
+Move every `#[cfg(test)]` module out of `src/` into Cargo's `tests/` directory, and compile the crate as Rust 2024.
+
+- [x] Set `edition = "2024"`
+- [x] Move client and server modules into the library so `tests/` can call them
+- [x] Place the former unit tests under `tests/` and keep `cargo test --offline --all-targets` green
+
+## Rename to mb-rs
+
+The package, library, and GitHub repository are `mb-rs` at https://github.com/alfred-hong/mb-rs. The installed commands stay `mb_client` and `mb_server`.
+
+- [x] Point the package, device identity, and README at https://github.com/alfred-hong/mb-rs
+- [x] Move the upstream path, description, and thanks to the end of the README
+- [x] Rename the GitHub repository from `alfred-hong/mb-cli` to `alfred-hong/mb-rs`
+
+## Release check
+
+Run every implemented function against a live server and compare the result with the documented behavior. Fix the code when a result disagrees.
+
+- [x] `cargo test --offline --all-targets` (lib 6, mb_client 38, mb_server 31, client_server 25, then the closed-pipe completion test)
+- [x] TCP client: reads 01-04, writes 05/06/15/16, mask, read-write, file, FIFO, diagnostics, identity, raw, decode, scan, retries
+- [x] Server: snapshot reload, delay, forced exception, silence, shared stations, broadcast
+- [x] Serial RTU through a pseudo-terminal, and RTU-over-TCP with a raw frame
+- [x] Open ModScan reads the TCP server snapshot: holding 1234/7, input 42/8, coil 1/0, discrete 0/0
+
+## Release check, remaining behavior
+
+Items the first pass did not exercise live. Deferred protocols stay deferred.
+
+- [x] Bind `0.0.0.0` when `--ip` is omitted, idle close, and port already in use
+- [x] CSV last-row wins, discrete and out-of-window rows rejected, no reload while running
+- [x] Forced exceptions 02 and 04, broadcast read, station 0 rejected
+- [x] Six-digit Modicon address, mask formula, FIFO kept, empty file record, identity objects
+- [x] Scan keeps a failed sample; `--timeout 0` repeats until interrupted
+- [x] RTU with even parity and two stop bits
+- [x] RTU-over-TCP answers the functions the framer accepts, and still drops 08, 20, and 21
+- [x] FC 43/13 returns exception 01 and the TCP connection stays open
 

@@ -1,6 +1,8 @@
-# mb-cli
+# mb-rs
 
 A fast and reliable Modbus TCP and RTU client/server command-line tool. Built on top of [tokio-modbus](https://github.com/slowtec/tokio-modbus).
+
+https://github.com/alfred-hong/mb-rs
 
 The definitive hub for all standard specifications is the Modbus Organization, an independent group of users and suppliers that governs the protocol.
 • Primary Web Portal: www.modbus.org
@@ -19,19 +21,24 @@ The definitive hub for all standard specifications is the Modbus Organization, a
 ## Installation
 
 ```bash
-cargo install --locked mb-cli
+cargo install --git https://github.com/alfred-hong/mb-rs --locked
 ```
 
-The package name is `mb-cli`. It installs two commands: `mb_client` and `mb_server`.
+The package name is `mb-rs`. That one install provides both commands, `mb_client` and `mb_server`.
+
+```bash
+mb_client completions bash
+mb_server --completions bash
+```
+
+`completions` also accepts `zsh`, `fish`, `powershell`, and `elvish`. The server flag prints the script and exits.
 
 ### From Source
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd mb-cli
+git clone https://github.com/alfred-hong/mb-rs
+cd mb-rs
 
-# Build and install
 cargo install --path .
 ```
 
@@ -135,7 +142,22 @@ mb_server --num-coils 1000 --num-discrete 1000 --num-holding 500 --num-input 500
 - `--timeout <SECONDS>` on a **read** command is how long to keep reading. Omit it and the command reads once. `10` repeats the read for 10 seconds, then exits. `0` or a negative value repeats until you interrupt it. On a terminal each sample replaces the previous one in the same place. Samples are `--interval` milliseconds apart (default 1000). Output sent to a pipe or a file keeps every sample. Connecting, and each individual request, stop after `--response-timeout` seconds when the peer stays silent (default 5).
 - Server `--timeout <seconds>` is separate (default: 5). It covers binding the TCP port, opening the serial port, and idle TCP connections.
 - `--verbose` / `-v` - Enable verbose output. On the server each line has the function code, station id, start address, quantity, outcome, and, for TCP, the client address.
-- `--modbus_address <id>` - Modbus station address (default: 0 for the client, 1 for the server). `--addr` is the same flag. These flags, and `--verbose`, `--notation`, and `--response-timeout`, follow the client subcommand (`read`, `write`, `diagnostics`, `raw`, or `read-write`). Repeat `--modbus_address` on the server to serve more than one station. Those stations share one memory image and the list stays fixed for the process. Station 0 is the broadcast address and cannot be selected as a served station. A broadcast write updates the shared image and no response is sent; a broadcast read gets no response. Any other id that was not listed gets no response.
+- `--retries <COUNT>` - Extra attempts after a timeout or a broken connection. See [Retries](#retries).
+- `--modbus_address <id>` - Modbus station address (default: 0 for the client, 1 for the server). `--addr` is the same flag. These flags, and `--verbose`, `--notation`, `--response-timeout`, and `--retries`, follow the client subcommand (`read`, `write`, `diagnostics`, `raw`, or `read-write`). Repeat `--modbus_address` on the server to serve more than one station. Those stations share one memory image and the list stays fixed for the process. Station 0 is the broadcast address and cannot be selected as a served station. A broadcast write updates the shared image and no response is sent; a broadcast read gets no response. Any other id that was not listed gets no response.
+
+#### Retries
+
+`--retries` applies to opening the connection and to every read or write. The default is 2. That is the first try plus two more, three tries in all, and then the command stops. `0` sends the request once. There is no extra wait between attempts. Each attempt still stops after `--response-timeout` seconds (default 5). The message from the last failed attempt is printed once.
+
+A Modbus exception, such as `IllegalDataAddress`, is the device's answer and is not sent again.
+
+Station 0 is not retried. The specification gives that address no response. Sending a write to station 0 again would store it again.
+
+A repeating `--timeout` scan retries inside each sample. When those attempts are used up, the failed sample stays on screen and the scan continues.
+
+Opening the connection is a new attempt each time. A refused or timed-out open is tried again, up to three times. A request retry uses the connection that is already open. If that socket closes after the request has been sent, the remaining attempts fail immediately and do not open another connection.
+
+A write whose response was lost may already be stored. A retry sends that write again.
 
 #### TCP Options
 
@@ -232,16 +254,19 @@ mb_client read-write --ip 127.0.0.1 --addr 1 --read-unit 0 --read-qty 2 --unit 0
 #### Read commands
 
 ```bash
-mb_client read <area> --unit <register> [--modbus_address <station>] [--qty <quantity>] [--timeout <SECONDS>] [--interval <MILLISECONDS>] [--log <FILE>] [--notation pdu|modicon] [--response-timeout <SECONDS>] [--decode <format>...] [--order msrf|lsrf] [--swap-bytes] [connection options]
+mb_client read <area> --unit <register> [--modbus_address <station>] [--qty <quantity>] [--timeout <SECONDS>] [--interval <MILLISECONDS>] [--log <FILE>] [--notation pdu|modicon] [--response-timeout <SECONDS>] [--retries <COUNT>] [--decode <format>...] [--order msrf|lsrf] [--swap-bytes] [connection options]
 ```
 
-- `--qty` defaults to 1. Coils and discrete inputs (FC 01/02) accept 1-2000. Holding and input registers (FC 03/04) accept 1-125.
+- `--qty` defaults to 1 and is a decimal number. Coils and discrete inputs (FC 01/02) accept 1-2000. Holding and input registers (FC 03/04) accept 1-125. `0`, a number above that limit, or a non-decimal quantity is rejected before a connection is opened. The message names the accepted range, for example `quantity 2001 is outside 1-2000 (FC 01/02)`.
 - `--decode`, `--order`, and `--swap-bytes` apply to `holding` and `input`. Coil and discrete reads do not take them. FIFO, file, and `read-write` accept the same three flags. A decoded read prints the interpretation in place of the raw register table.
+- `read fifo` uses `--unit` as the FIFO pointer, a holding-register address. The register at that address holds the queue count, and the registers after it are the queued values. The count is at most 31. A count above 31 returns exception 03 (`IllegalDataValue`). The read does not clear the queue.
+- `read file` repeats `--group FILE:RECORD:LENGTH`. The file number is 1-65535. The record is 0-9999 (`0x270F`), and the length must stay inside that range. `1:10000:1` is rejected before a connection is opened, with `file record 10000 is outside 0-9999 (0x270F)`.
 - `--timeout` repeats that read and redraws the sample in place. It is not accepted by writes. `mb_client read-write` still runs once, because repeating it would write again.
 - `--interval` is the milliseconds from one sample to the next. The default is 1000. `0` sends the next request as soon as the previous one finishes. A failed sample during `--timeout` stays on screen and the scan continues. Each repeating sample ends with `requests=N valid=M`.
-- `--log FILE` appends one line per sample: a UTC timestamp, then the sample text with line breaks replaced by ` | `.
+- `--log FILE` appends one line per sample: a UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`, then the sample text with line breaks replaced by ` | `.
 - `--notation modicon` prints `00001`, `10001`, `30001`, and `40001` instead of the protocol address. Offsets above 9999 use six digits, so protocol address 9999 is `410000`.
 - `--response-timeout` is the seconds allowed for the connection and for each response. The default is 5. It is separate from `--timeout`.
+- `--retries` is how many extra attempts follow a timeout or a broken connection. The default is 2. See [Retries](#retries).
 - `--verbose` prints the bytes of each transmitted and received frame, prefixed `tx` and `rx`.
 
 ```bash
@@ -253,7 +278,7 @@ mb_client read holding --ip 127.0.0.1 --addr 1 --unit 0 --qty 1 --verbose
 mb_client raw --ip 127.0.0.1 --addr 1 --function 3 --data 00,00,00,01
 ```
 
-`mb_client raw` sends one function code from 1 to 127 and prints the response. `--function` is decimal or `0x`. `--data` is the bytes after the function code, written as hex and separated by commas or spaces. An empty `--data` sends no extra bytes.
+`mb_client raw` sends one function code from 1 to 127 and prints the response. `--function` is decimal or `0x`. `--data` is the bytes after the function code, written as hex and separated by commas or spaces. An empty `--data` sends no extra bytes. `--data` does not apply the `--qty` limits. A raw read whose quantity is 0, whose register quantity is 126, or whose coil quantity is 2001 is sent, and the server returns exception 03. For `--function 5`, the value word in `--data` must be `FF,00` (ON) or `00,00` (OFF). Any other word is rejected before connecting, with `coil value must be FF00 or 0000`.
 
 Other reads:
 
@@ -270,17 +295,17 @@ mb_client read device-id --ip 127.0.0.1 --addr 1 --code extended
 mb_client read device-id --ip 127.0.0.1 --addr 1 --code specific --object 0
 ```
 
-`--code` is `basic`, `regular`, `extended`, or `specific`. `--object` selects one object for `specific`, or the first object of a stream. The memory server reports conformity `0x82` (regular identification, stream and individual access). An extended request is answered at that level. CANopen general reference (FC 43/13) is not implemented.
+`--code` is `basic`, `regular`, `extended`, or `specific`. It defaults to `basic`. `--object` defaults to 0. For `specific`, `--object` is the one object to return, from 0 to 255. For the other three codes, `--object` is the first object of the stream. If that object is not a known object, the server answers as if `--object 0` had been used. An unknown `specific` object returns exception 02 (`IllegalDataAddress`). The memory server reports conformity `0x82` (regular identification, stream and individual access). An `extended` request is answered at that level, objects 0x00-0x06. CANopen general reference (FC 43/13) is not implemented.
 
 Objects returned by this server:
 
 | Id | Name | Value |
 | --- | --- | --- |
-| 0x00 | VendorName | `mb-cli` |
+| 0x00 | VendorName | `mb-rs` |
 | 0x01 | ProductCode | `mb` |
 | 0x02 | MajorMinorRevision | the crate version |
-| 0x03 | VendorUrl | `https://github.com/wkrettek/mb-cli` |
-| 0x04 | ProductName | `mb-cli` |
+| 0x03 | VendorUrl | `https://github.com/alfred-hong/mb-rs` |
+| 0x04 | ProductName | `mb-rs` |
 | 0x05 | ModelName | `memory-server` |
 | 0x06 | UserApplicationName | empty |
 
@@ -289,24 +314,29 @@ Objects returned by this server:
 #### Write commands
 
 ```bash
-mb_client write <area> --unit <register> [--modbus_address <station>] --value <values> [connection options]
+mb_client write <area> --unit <register> [--modbus_address <station>] [--response-timeout <SECONDS>] [--retries <COUNT>] --value <values> [connection options]
 ```
 
-- One coil uses FC 05. Several coils use FC 15, at most 1968 values. `0` is OFF and any other word is ON.
-- One holding register uses FC 06. Several use FC 16, at most 123 values.
-- Mask write (FC 22) applies `(current AND and-mask) OR (or-mask AND NOT and-mask)`:
+- One coil uses FC 05. `--value 0` is sent as `0x0000` (OFF). Any other word, such as `1` or `0x0002`, is sent as `0xFF00` (ON). Several coils use FC 15. `--value` then takes 2-1968 comma-separated words, and the same 0 / non-zero rule applies to each word. More than 1968 values is rejected before connecting.
+- On TCP, a function 05 frame whose value is not `0x0000` or `0xFF00` returns exception 03 and leaves the coil unchanged. `write coil` does not send those other values. `raw --function 5` rejects them before connecting.
+- One holding register uses FC 06. Several use FC 16, at most 123 values. `--value` words are decimal or `0x` hex, from 0 to 65535.
+- Station 0 (`--addr 0` or `--modbus_address 0`) is broadcast. A write is stored and no response is sent, so the client times out. That address is not retried. `--retries 0` makes the single wait equal to `--response-timeout`.
+- Mask write (FC 22) applies `(current AND --and) OR (--or AND NOT --and)`. Both masks are required. With the register holding `0x0012`, the specification example is:
 
 ```bash
+mb_client write holding --ip 127.0.0.1 --addr 1 --unit 4 --value 0x0012
 mb_client write mask --ip 127.0.0.1 --addr 1 --unit 4 --and 0x00F2 --or 0x0025
 ```
 
-- File records (FC 21). Each group is `FILE:RECORD:v1,v2`:
+The register then reads `0x0017`.
+
+- File records (FC 21). Each `--group` is `FILE:RECORD:v1,v2`. The file number is 1-65535. Records run from 0 through 9999 (`0x270F`), including every value in the group. A record of 10000, or a span past 9999, is rejected before connecting:
 
 ```bash
 mb_client write file --ip 127.0.0.1 --addr 1 --group 4:7:0x1234,2
 ```
 
-- Read/write multiple registers (FC 23) writes first, then reads. The write is 1-121 registers and the read is 1-125. `--decode` prints only the interpretation of the values just read:
+- Read/write multiple registers (FC 23) writes first, then reads. `--value` is 1-121 words. `--read-qty` is 1-125 and defaults to 1. `--read-unit` is the first register to read. `--unit` is the first register to write. `--decode` prints only the interpretation of the values just read:
 
 ```bash
 mb_client read-write --ip 127.0.0.1 --addr 1 --read-unit 0 --read-qty 2 --unit 0 --value 9,8 --decode i32
@@ -359,7 +389,7 @@ mb_client diagnostics --ip 127.0.0.1 --addr 1 --sub ascii-delimiter --data 0x0A0
 | 08 | `mb_client diagnostics` | serial-line diagnostics |
 | 11 | `mb_client read event-counter` | status and event count |
 | 12 | `mb_client read event-log` | newest event first, 64 retained |
-| 17 | `mb_client read server-id` | station address, run status, `mb-cli` |
+| 17 | `mb_client read server-id` | station address, run status, `mb-rs` |
 | 20 | `mb_client read file` | file 1-65535, records 0-0x270F, reference type 6 |
 | 21 | `mb_client write file` | echoes the request |
 | 22 | `mb_client write mask` | one holding register |
@@ -368,7 +398,7 @@ mb_client diagnostics --ip 127.0.0.1 --addr 1 --sub ascii-delimiter --data 0x0A0
 | 43 / 14 | `mb_client read device-id` | MEI type 14 |
 | 43 / 13 | — | CANopen general reference is not implemented |
 
-A quantity of 0 or a quantity above the function limit returns exception 03 (illegal data value). An address outside the configured table returns exception 02 (illegal data address). An unknown function returns exception 01. Reserved and user-defined function codes are not implemented. File records start at 0 until written. The FIFO read does not clear the queue.
+A quantity of 0 or a quantity above the function limit returns exception 03 (illegal data value). An address outside the configured table returns exception 02 (illegal data address). An unknown function returns exception 01. On TCP, function 05 accepts only `0x0000` (OFF) and `0xFF00` (ON). Any other value returns exception 03 and leaves the coil unchanged. Reserved and user-defined function codes are not implemented. File records start at 0 until written. The FIFO read does not clear the queue. A FIFO count above 31 returns exception 03. An unknown device-identification object restarts a stream at object 0, and an unknown individual object returns exception 02.
 
 #### Specification coverage
 
@@ -483,10 +513,16 @@ mb_client read coil --ip 127.0.0.1 --port 5020 --addr 1 --unit 0 --qty 8 --verbo
 
 The tool provides detailed error messages for common issues:
 
-- **Connection timeouts**: The message names the peer and how many seconds were allowed, and it is printed once
-- **Modbus exceptions**: The exception name, such as `IllegalDataAddress`, is printed once
-- **Validation errors**: A rejected quantity, address, file reference, station id, interval, or diagnostics name states the accepted range. `--swap-bytes` and `--order lsrf` without `--decode` stop before a connection is opened. A negative number is reported as an invalid value
+- **Connection timeouts**: The message names the peer and how many seconds were allowed. After the retries are used up, that message is printed once
+- **Modbus exceptions**: The exception name, such as `IllegalDataAddress`, is printed once and the request is not sent again
+- **Validation errors**: A rejected quantity, address, file reference, station id, interval, coil value, or diagnostics name states the accepted range. `--qty` outside 1-2000 or 1-125, a file record outside 0-9999, more than 1968 coil values, more than 123 holding values, or a function 23 write outside 1-121 stops before a connection is opened. `raw --function 5` with a value other than `FF,00` or `00,00` stops with `coil value must be FF00 or 0000`. `--swap-bytes` and `--order lsrf` without `--decode` stop before a connection is opened. A negative number is reported as an invalid value
 - **Flag order**: `--ip`, `--device`, `--addr`, and the other connection flags follow the command. Using one of them before `read` or `write` says to put it after the command
 - **Read-only areas**: Writing discrete inputs or input registers stops before a connection is opened
 - **Area mismatch**: A `0XXXX` / `1XXXX` / `3XXXX` / `4XXXX` reference is rejected when its prefix belongs to another command
 - **Connection failures**: Network and serial port error details
+
+## Origin
+
+- **Path:** https://github.com/wkrettek/mb-cli
+- **Description:** A fast and reliable Modbus TCP and RTU client/server command-line tool. Built on top of [tokio-modbus](https://github.com/slowtec/tokio-modbus).
+- **Thanks:** Warren Krettek, for the original `mb-cli` client, memory server, and the work this repository continues.

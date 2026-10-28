@@ -1,22 +1,31 @@
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod address;
 mod cli;
 mod handle;
-mod server;
+mod runtime;
+mod serial;
 mod snapshot;
 
 use anyhow::Context;
-use clap::Parser;
-use cli::{forced_fault, served_stations, Cli};
-use server::{
-    run_rtu_over_tcp_server, run_rtu_server, run_tcp_server, server_listen, ModbusData,
-    ServerListen, ServerRuntime,
+use clap::{CommandFactory, Parser};
+use cli::{Cli, forced_fault, served_stations};
+use runtime::{
+    ModbusData, ServerListen, ServerRuntime, run_rtu_over_tcp_server, run_rtu_server,
+    run_tcp_server, server_listen,
 };
+use snapshot::{load_file, save_file};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Some(shell) = cli.completions {
+        let mut command = Cli::command();
+        write_completions(shell, &mut command, "mb_server")?;
+        return Ok(());
+    }
     let stations = served_stations(&cli.units)?;
     let forced = forced_fault(cli.exception_function, cli.exception_code)?;
     let listen = server_listen(cli.ip, cli.device.clone(), cli.rtu_over_tcp)?;
@@ -28,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     )));
     if let Some(path) = &cli.csv {
         let mut guard = data.write().await;
-        snapshot::load_file(&mut guard, path)?;
+        load_file(&mut guard, path)?;
     }
 
     print_config(&cli, &stations);
@@ -70,10 +79,26 @@ async fn main() -> anyhow::Result<()> {
     if result.is_ok() {
         if let Some(path) = &cli.csv {
             let guard = data.read().await;
-            snapshot::save_file(&guard, path).context("saving the CSV snapshot")?;
+            save_file(&guard, path).context("saving the CSV snapshot")?;
         }
     }
     result
+}
+
+/// Write a completion script. A closed pipe is a normal end, not a panic.
+fn write_completions(
+    shell: clap_complete::Shell,
+    command: &mut clap::Command,
+    bin_name: &str,
+) -> anyhow::Result<()> {
+    let mut script = Vec::new();
+    clap_complete::generate(shell, command, bin_name, &mut script);
+    let mut out = std::io::stdout().lock();
+    match std::io::Write::write_all(&mut out, &script).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn print_config(cli: &Cli, stations: &[u8]) {
@@ -119,3 +144,19 @@ fn print_config(cli: &Cli, stations: &[u8]) {
     );
     println!();
 }
+
+#[cfg(test)]
+#[path = "server_cli_tests.rs"]
+mod server_cli_tests;
+
+#[cfg(test)]
+#[path = "server_handle_tests.rs"]
+mod server_handle_tests;
+
+#[cfg(test)]
+#[path = "server_service_tests.rs"]
+mod server_service_tests;
+
+#[cfg(test)]
+#[path = "server_snapshot_tests.rs"]
+mod server_snapshot_tests;

@@ -19,10 +19,10 @@ jobs:
           toolchain: stable
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --verbose --all-targets
 
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Check formatting
         run: cargo fmt -- --check

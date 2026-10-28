@@ -35,7 +35,7 @@ impl Server {
     fn start(extra: &[&str]) -> Self {
         let _guard = startup_lock().lock().expect("server startup lock");
         let port = free_port();
-        let csv = std::env::temp_dir().join(format!("mb-cli-{}-{port}.csv", std::process::id()));
+        let csv = std::env::temp_dir().join(format!("mb-rs-{}-{port}.csv", std::process::id()));
         std::fs::write(&csv, SNAPSHOT).expect("write snapshot");
 
         let port_text = port.to_string();
@@ -355,7 +355,16 @@ fn unknown_station_gets_no_response() {
     let output = run_client(
         server.port,
         &[
-            "read", "holding", "--addr", "9", "--unit", "0", "--qty", "1",
+            "read",
+            "holding",
+            "--addr",
+            "9",
+            "--unit",
+            "0",
+            "--qty",
+            "1",
+            "--response-timeout",
+            "1",
         ],
     );
     assert!(!output.status.success());
@@ -368,7 +377,16 @@ fn silence_discards_a_client_write() {
     let output = run_client(
         server.port,
         &[
-            "write", "holding", "--addr", "1", "--unit", "1", "--value", "55",
+            "write",
+            "holding",
+            "--addr",
+            "1",
+            "--unit",
+            "1",
+            "--value",
+            "55",
+            "--response-timeout",
+            "1",
         ],
     );
     assert!(!output.status.success());
@@ -424,7 +442,16 @@ fn broadcast_write_updates_the_shared_image() {
     let output = run_client(
         server.port,
         &[
-            "write", "holding", "--addr", "0", "--unit", "0", "--value", "77",
+            "write",
+            "holding",
+            "--addr",
+            "0",
+            "--unit",
+            "0",
+            "--value",
+            "77",
+            "--response-timeout",
+            "1",
         ],
     );
     expect_no_response(&output);
@@ -470,7 +497,7 @@ fn server_rejects_bad_arguments_and_snapshots() {
     );
 
     let dir = std::env::temp_dir();
-    let discrete = dir.join(format!("mb-cli-discrete-{}.csv", std::process::id()));
+    let discrete = dir.join(format!("mb-rs-discrete-{}.csv", std::process::id()));
     std::fs::write(&discrete, "area,address,value\ndiscrete,0,1\n").unwrap();
     expect_server_rejects(
         &[
@@ -485,7 +512,7 @@ fn server_rejects_bad_arguments_and_snapshots() {
     );
     let _ = std::fs::remove_file(&discrete);
 
-    let outside = dir.join(format!("mb-cli-outside-{}.csv", std::process::id()));
+    let outside = dir.join(format!("mb-rs-outside-{}.csv", std::process::id()));
     std::fs::write(&outside, "area,address,value\nholding,5,1\n").unwrap();
     expect_server_rejects(
         &[
@@ -500,7 +527,7 @@ fn server_rejects_bad_arguments_and_snapshots() {
     );
     let _ = std::fs::remove_file(&outside);
 
-    let missing = dir.join(format!("mb-cli-missing-{}.csv", std::process::id()));
+    let missing = dir.join(format!("mb-rs-missing-{}.csv", std::process::id()));
     let _ = std::fs::remove_file(&missing);
     expect_server_rejects(
         &["--ip", "127.0.0.1", "--csv", missing.to_str().unwrap()],
@@ -605,7 +632,7 @@ fn a_failed_scan_stays_up_and_counts_the_miss() {
 #[test]
 fn scan_log_records_each_sample() {
     let server = Server::start(&[]);
-    let path = std::env::temp_dir().join(format!("mb-cli-scan-{}.log", std::process::id()));
+    let path = std::env::temp_dir().join(format!("mb-rs-scan-{}.log", std::process::id()));
     let log = path.to_str().expect("log path");
     let output = run_client(
         server.port,
@@ -692,8 +719,64 @@ fn response_timeout_ends_a_silent_station_sooner() {
             "1",
         ],
     );
-    assert!(started.elapsed() < Duration::from_secs(3));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(5),
+        "three one-second attempts took {elapsed:?}"
+    );
     expect_no_response(&output);
+}
+
+#[test]
+fn mei_type_13_returns_illegal_function_on_the_same_connection() {
+    let server = Server::start(&[]);
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    let mei13 = [0x00, 0x11, 0x00, 0x00, 0x00, 0x04, 0x01, 0x2B, 0x0D, 0x00];
+    std::io::Write::write_all(&mut stream, &mei13).expect("write mei 13");
+    let mut buf = [0u8; 16];
+    let n = std::io::Read::read(&mut stream, &mut buf).expect("read exception");
+    assert_eq!(
+        &buf[..n],
+        &[0x00, 0x11, 0x00, 0x00, 0x00, 0x03, 0x01, 0xAB, 0x01]
+    );
+    let read = [
+        0x00, 0x12, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+    ];
+    std::io::Write::write_all(&mut stream, &read).expect("write holding read");
+    let n = std::io::Read::read(&mut stream, &mut buf).expect("read holding");
+    assert!(n >= 11, "short response {n} {buf:?}");
+    assert_eq!(buf[7], 0x03, "function {buf:?}");
+    assert_eq!(&buf[9..11], &1234u16.to_be_bytes());
+}
+
+#[test]
+fn illegal_coil_value_returns_exception_03_and_leaves_the_coil() {
+    let server = Server::start(&[]);
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    let illegal = [
+        0x00, 0x21, 0x00, 0x00, 0x00, 0x06, 0x01, 0x05, 0x00, 0x00, 0x00, 0x01,
+    ];
+    std::io::Write::write_all(&mut stream, &illegal).expect("write illegal coil");
+    let mut buf = [0u8; 16];
+    let n = std::io::Read::read(&mut stream, &mut buf).expect("read exception");
+    assert_eq!(
+        &buf[..n],
+        &[0x00, 0x21, 0x00, 0x00, 0x00, 0x03, 0x01, 0x85, 0x03]
+    );
+    let read = [
+        0x00, 0x22, 0x00, 0x00, 0x00, 0x06, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01,
+    ];
+    std::io::Write::write_all(&mut stream, &read).expect("write coil read");
+    let n = std::io::Read::read(&mut stream, &mut buf).expect("read coil");
+    assert!(n >= 10, "short response {n} {buf:?}");
+    assert_eq!(buf[7], 0x01, "function {buf:?}");
+    assert_eq!(buf[9], 0x01, "coil 0 changed: {buf:?}");
 }
 
 #[test]
@@ -1035,14 +1118,14 @@ fn every_write_file_fifo_identity_and_diagnostic() {
     let identity = client_ok(port, &["read", "server-id", "--addr", "1"]);
     assert!(identity.contains("Server ID: 1"), "{identity}");
     assert!(identity.contains("ON"), "{identity}");
-    assert!(identity.contains("mb-cli"), "{identity}");
+    assert!(identity.contains("mb-rs"), "{identity}");
 
     let basic = client_ok(
         port,
         &["read", "device-id", "--addr", "1", "--code", "basic"],
     );
     assert!(basic.contains("VendorName"), "{basic}");
-    assert!(basic.contains("mb-cli"), "{basic}");
+    assert!(basic.contains("mb-rs"), "{basic}");
     assert!(basic.contains("0x82"), "{basic}");
     let regular = client_ok(
         port,
@@ -1233,6 +1316,38 @@ fn every_write_file_fifo_identity_and_diagnostic() {
         ],
         "1-125",
     );
+}
+
+#[test]
+fn completions_survive_a_closed_pipe() {
+    for (bin, args) in [
+        (
+            env!("CARGO_BIN_EXE_mb_client"),
+            &["completions", "bash"][..],
+        ),
+        (
+            env!("CARGO_BIN_EXE_mb_server"),
+            &["--completions", "zsh"][..],
+        ),
+    ] {
+        let mut child = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn completions");
+        let mut stdout = child.stdout.take().expect("stdout");
+        let mut sample = [0u8; 64];
+        let _ = std::io::Read::read(&mut stdout, &mut sample);
+        drop(stdout);
+        let status = child.wait().expect("wait");
+        let mut err = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut err);
+        }
+        assert!(status.success(), "{bin} {args:?} failed: {err}");
+        assert!(!err.contains("panicked"), "{bin} panicked:\n{err}");
+    }
 }
 
 fn usage_text(args: &[&str]) -> String {
