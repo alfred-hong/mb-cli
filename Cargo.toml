@@ -1,9 +1,9 @@
 [package]
 name = "mb-rs"
-version = "1.2.3"
+version = "1.2.4"
 edition = "2024"
 rust-version = "1.85"
-authors = ["Warren Krettek <warrenkrettek@gmail.com>"]
+authors = ["alfred-hong <alfred.hong.learn@gmail.com>"]
 description = "Modbus TCP and RTU client (mb_client) and memory server (mb_server)"
 readme = "README.md"
 homepage = "https://github.com/alfred-hong/mb-rs"
