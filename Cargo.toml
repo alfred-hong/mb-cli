@@ -14,7 +14,6 @@ categories = ["command-line-utilities", "network-programming"]
 exclude = [
     "target/",
     "AGENTS.md",
-    "ana-deployment@10.10.50.71",
 ]
 
 [dependencies]
